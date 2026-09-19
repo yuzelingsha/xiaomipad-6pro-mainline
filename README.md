@@ -96,7 +96,7 @@ and device trees; other batches, capacities and accessory combinations are not i
 | Power / volume keys | Qualcomm PMIC / GPIO input | ✅ Working | Screen on/off, power menu and volume; password-lock authentication not separately tested |
 | Battery / basic charging | qcom_battmgr / UPower | ✅ Working | Capacity reporting, charging state and basic wall charging |
 | Computer USB power | USB power path | 🟡 Partial | Limited supply power; heavy workloads may still discharge the battery |
-| Xiaomi proprietary fast charging | Vendor charging protocol | ❌ Unsupported | Fast charging is not integrated; no stock charging-power claim |
+| Xiaomi proprietary fast charging | Vendor charging protocol | 🟡 Partial | Charger authentication integrated; battery authentication verified and PD adapters reach 9 V / 2 A. MiPPS and standard PPS fast charging await adapter validation |
 | Charging while powered off | Boot-stage charging hold | 🟡 Partial | No complete charging display; use a long power-key press to boot while charging |
 | Suspend / resume | Linux power management | 🟡 Partial | Basic resume verified; peripheral recovery and deep-sleep power need further testing |
 | RTC / offline time retention | Qualcomm PMK8350 RTC | 🧪 Unverified | Network time synchronization works; offline writes and power-loss retention are not guaranteed |
@@ -107,6 +107,8 @@ Ubuntu packages are managed through APT. Update instructions for the project ker
 Do not mix boot images and system components from different releases.
 
 To run Android applications inside Ubuntu, Waydroid is supported; the required kernel configuration is built in. See [Waydroid support](docs/WAYDROID.md).
+
+Charging power is negotiated through the vendor charger authentication path. See [Fast charging](docs/FASTCHARGE.md).
 
 Report problems through GitHub Issues with the device model, system version, reproduction steps and relevant logs.
 Remove passwords, network credentials and personal information before sharing logs.

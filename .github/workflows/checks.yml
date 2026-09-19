@@ -18,6 +18,9 @@ jobs:
           from pathlib import Path
           for path in Path('tools').rglob('*.py'):
               ast.parse(path.read_text(), filename=str(path))
+          for path in sorted(Path('device/gnome-overlay/usr/local/libexec').iterdir()):
+              if path.is_file() and path.read_bytes().startswith(b'#!/usr/bin/env python3'):
+                  ast.parse(path.read_text(), filename=str(path))
           for path in Path('tools').rglob('*.sh'):
               subprocess.run(['sh', '-n', str(path)], check=True)
           PY

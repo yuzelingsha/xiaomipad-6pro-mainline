@@ -28,6 +28,15 @@ Pinned repositories and revisions: device/sensors/sources.manifest.
 The patches under device/sensors/patches retain the licenses of the components
 they modify.
 
+Charger authentication
+----------------------
+
+* liuqin-mipps-auth (device/gnome-overlay/usr/local/libexec/liuqin-mipps-auth)
+  is derived from xiaomi-mipps-auth by ianchb,
+  https://github.com/ianchb/xiaomi-mipps-auth, GPL-2.0-only; the file-level
+  SPDX identifier and authorship notice are retained. It is not covered by
+  the project's MIT license.
+
 Desktop and build components
 ----------------------------
 
