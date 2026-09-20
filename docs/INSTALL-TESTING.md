@@ -65,6 +65,45 @@ requires repeating that validation.
 Observe the ROM's own anti-rollback rule: its version must be at least the
 version already fused into the tablet.
 
+### Replacing the Android boot image
+
+`--layout dual` accepts `--android-boot IMG`, which writes `IMG` to `boot_a`
+instead of the ROM's own `boot.img`. Every other stock image is still verified
+against the pinned checksums, and the override itself is admitted only when it
+is exactly as long as the stock `boot.img` and begins with the Android boot
+magic. Its sha256 is printed in the plan summary and again in the erasure
+confirmation, and the image is always written, whatever the partition already
+holds. The option is rejected with any layout other than `dual`.
+
+This is how a root-enabled Android is installed alongside Ubuntu.
+`tools/patch-android-boot-ksu.py` produces such an image entirely on the host:
+it unpacks the stock `boot.img`, renames `init` to `init.real` in the ramdisk,
+installs KernelSU's `ksuinit` as `init` and the matching loadable module as
+`/kernelsu.ko`, and repacks the image with the kernel, the command line and
+every other header field unchanged. The KernelSU release it draws on is pinned
+in `tools/lib/kernelsu-assets.json` and fetched by
+`tools/fetch-kernelsu-assets.sh`.
+
+```sh
+sh tools/fetch-kernelsu-assets.sh
+python3 tools/patch-android-boot-ksu.py \
+  --boot /path/to/extracted-stock-rom/images/boot.img \
+  --ksuinit tools/local/downloads/kernelsu/v3.3.0/ksuinit-aarch64 \
+  --lkm tools/local/downloads/kernelsu/v3.3.0/lkm-aarch64-android12-5.10_kernelsu.ko \
+  --out out/android-ksu/boot-ksu.img --report out/android-ksu/boot-ksu.report.txt
+```
+
+The tool refuses to write anything unless an unpatched unpack-and-repack of the
+same image reproduces the stock bytes exactly, so the only difference between
+its output and the stock image is the ramdisk it was asked to change.
+
+Any change to the ramdisk invalidates the AVB boot signature and the vbmeta
+hash descriptor for that partition, so the resulting image boots only on an
+unlocked bootloader. Root also makes Android able to modify slot B: the
+`liuqin_boot_ubuntu` KernelSU module disables the system updater on every boot
+for that reason, because an Android over-the-air update rewrites the inactive
+slot, which is where Ubuntu lives.
+
 ## Requirements
 
 - Xiaomi Pad 6 Pro (liuqin) with the factory partition table, 4096-byte
@@ -100,6 +139,13 @@ python3 install.py --bundle . --serial DEVICE_SERIAL \
 python3 install.py --bundle . --serial DEVICE_SERIAL \
   --backup /path/to/new-private-backup --erase-userdata --layout dual \
   --rom-dir /path/to/extracted-stock-rom --android-size 96G --root-size 32G
+```
+
+```sh
+python3 install.py --bundle . --serial DEVICE_SERIAL \
+  --backup /path/to/new-private-backup --erase-userdata --layout dual \
+  --rom-dir /path/to/extracted-stock-rom --android-boot /path/to/boot-ksu.img \
+  --android-size 96G --root-size 32G
 ```
 
 Use `python3 install.py --bundle . --check` for an optional local-only check;

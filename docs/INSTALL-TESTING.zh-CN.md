@@ -53,6 +53,36 @@
 
 同时需遵守 ROM 自身的防回滚要求：ROM 版本不得低于设备已熔断的版本。
 
+### 替换 Android 侧 boot 镜像
+
+`--layout dual` 可附加 `--android-boot IMG`，将 `IMG` 写入 `boot_a`，取代 ROM 自带的
+`boot.img`。其余原厂镜像仍按固定校验值逐一核对；替换镜像本身只有在长度与原厂 `boot.img`
+完全一致、且以 Android boot 魔数开头时才被接受。其 sha256 会出现在布局计划与清除数据确认中，
+并且无论分区当前内容为何都会写入。该参数在 `dual` 以外的布局下一律拒绝。
+
+这是在 Ubuntu 旁安装带 root 的 Android 的方式。`tools/patch-android-boot-ksu.py`
+完全在主机侧生成这样的镜像：解包原厂 `boot.img`，将 ramdisk 中的 `init` 改名为 `init.real`，
+以 KernelSU 的 `ksuinit` 作为新的 `init`，并加入匹配的内核模块 `/kernelsu.ko`，
+重新打包时保持内核、命令行以及其余头部字段不变。所依据的 KernelSU 发行版固定记录在
+`tools/lib/kernelsu-assets.json`，由 `tools/fetch-kernelsu-assets.sh` 下载并校验。
+
+```sh
+sh tools/fetch-kernelsu-assets.sh
+python3 tools/patch-android-boot-ksu.py \
+  --boot /path/to/extracted-stock-rom/images/boot.img \
+  --ksuinit tools/local/downloads/kernelsu/v3.3.0/ksuinit-aarch64 \
+  --lkm tools/local/downloads/kernelsu/v3.3.0/lkm-aarch64-android12-5.10_kernelsu.ko \
+  --out out/android-ksu/boot-ksu.img --report out/android-ksu/boot-ksu.report.txt
+```
+
+该工具会先对同一镜像做一次不修改内容的解包重打包，只有结果与原厂镜像逐字节一致才继续，
+因此输出与原厂镜像的差异只存在于被要求修改的 ramdisk。
+
+修改 ramdisk 会使该分区的 AVB boot 签名与 vbmeta 哈希描述符失效，
+因此生成的镜像只能在已解锁 Bootloader 的设备上启动。root 之后 Android 同样具备改写 B 槽的能力：
+`liuqin_boot_ubuntu` KernelSU 模块因此在每次开机时停用系统更新程序——
+Android 的 OTA 会改写非活动槽，而 Ubuntu 正位于该槽。
+
 ## 准备
 
 - Xiaomi Pad 6 Pro（liuqin），出厂分区表、4096 字节逻辑扇区，且 `userdata` 为最后一个分区；
@@ -85,6 +115,13 @@ python3 install.py --bundle . --serial DEVICE_SERIAL \
 python3 install.py --bundle . --serial DEVICE_SERIAL \
   --backup /path/to/new-private-backup --erase-userdata --layout dual \
   --rom-dir /path/to/extracted-stock-rom --android-size 96G --root-size 32G
+```
+
+```sh
+python3 install.py --bundle . --serial DEVICE_SERIAL \
+  --backup /path/to/new-private-backup --erase-userdata --layout dual \
+  --rom-dir /path/to/extracted-stock-rom --android-boot /path/to/boot-ksu.img \
+  --android-size 96G --root-size 32G
 ```
 
 只检查文件、不访问设备时使用 `python3 install.py --bundle . --check`；

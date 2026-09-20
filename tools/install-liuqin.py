@@ -112,6 +112,10 @@ def parse_arguments(argv=None):
                         help='Reinstall the system on an existing split layout and keep linux_home')
     parser.add_argument('--rom-dir', type=Path,
                         help='Extracted stock Fastboot ROM directory; required by --layout dual')
+    parser.add_argument('--android-boot', type=Path, metavar='IMG',
+                        help='Flash this boot image to the Android slot instead of the stock '
+                             'boot.img; only applies to --layout dual. Every other stock image '
+                             'is still verified against the pinned checksums.')
     parser.add_argument('--restore-partition-table', type=Path, metavar='BACKUP_DIR',
                         help='Restore the partition table saved in an earlier backup directory and stop')
     parser.add_argument('--yes', action='store_true', help='Skip the interactive data-erasure confirmation')
@@ -144,12 +148,20 @@ def validate_arguments(parser, args, preview=False):
                      ' —— 现有分区尺寸不可调整，请勿同时指定尺寸参数')
     if args.restore_partition_table is not None:
         for name, value in (('--layout', args.layout), ('--rom-dir', args.rom_dir),
+                            ('--android-boot', args.android_boot),
                             ('--android-size', args.android_size), ('--root-size', args.root_size)):
             if value:
                 parser.error('--restore-partition-table is a separate action; ' + name + ' does not apply')
         if not preview and not args.serial:
             parser.error('--restore-partition-table requires --serial')
         return
+    if args.android_boot is not None:
+        # The override decides what Android boots from, so it is checked on the
+        # offline path as well: nothing about it needs a device.
+        if args.layout != 'dual':
+            parser.error('--android-boot only applies to --layout dual'
+                         ' —— 仅双系统模式可替换 Android 侧 boot 镜像')
+        check_android_boot(parser, args.android_boot)
     if preview:
         return
     if not args.layout:
@@ -161,15 +173,44 @@ def validate_arguments(parser, args, preview=False):
         parser.error('--rom-dir only applies to --layout dual')
 
 
-def verify_rom(parser, rom_dir):
-    """Check every stock image this installation writes against the pinned table."""
+def check_android_boot(parser, path):
+    """Accept an Android boot override only if it can occupy the stock partition.
+
+    The image replaces a verified stock image, so it is held to the two
+    properties that can be checked without a device: it is exactly as long as
+    the stock boot.img the pinned table describes, and it starts with the
+    Android boot magic.  Its content is the operator's responsibility and its
+    checksum is printed wherever the plan is shown.
+    """
+    table = load_rom_table(parser)
+    expected = table['images']['boot.img']['bytes']
+    if not path.is_file():
+        parser.error('--android-boot is not a file: ' + str(path))
+    if path.stat().st_size != expected:
+        parser.error(f'--android-boot must be exactly {expected} bytes, the size of the stock '
+                     f'boot.img in {table["rom"]}; {path} is {path.stat().st_size} bytes'
+                     ' —— 替换镜像必须与原厂 boot 分区等长')
+    with path.open('rb') as stream:
+        if stream.read(8) != b'ANDROID!':
+            parser.error('--android-boot does not start with the Android boot magic: ' + str(path) +
+                         ' —— 该文件不是 Android boot 镜像')
+    return sha(path)
+
+
+def load_rom_table(parser):
+    """The pinned stock-ROM identities, from the repository or from the bundle."""
     here = Path(__file__).resolve().parent
     pinned = next((item for item in (here / 'lib/liuqin-rom-images.json',
                                      here / 'liuqin-rom-images.json') if item.is_file()), None)
     if pinned is None:
         parser.error('liuqin-rom-images.json is missing next to this program'
                      ' —— 安装包不完整，请下载同一版本的全部文件')
-    table = json.loads(pinned.read_text())
+    return json.loads(pinned.read_text())
+
+
+def verify_rom(parser, rom_dir, android_boot=None):
+    """Check every stock image this installation writes against the pinned table."""
+    table = load_rom_table(parser)
     images = rom_dir.resolve()
     if (images / 'images').is_dir():
         images = images / 'images'
@@ -183,6 +224,12 @@ def verify_rom(parser, rom_dir):
             parser.error('ROM image does not match the pinned ' + table['rom'] + ' release: ' + name +
                          ' —— 原厂镜像与本项目验证过的版本不一致，请使用 ' + table['rom'])
         selected[name] = dict(entry, path=path)
+    if android_boot is not None:
+        # Every stock image was verified above; only now is the Android boot
+        # image swapped, so the override can never skip a checksum.
+        override = android_boot.resolve()
+        selected['boot.img'] = dict(selected['boot.img'], path=override, sha256=sha(override),
+                                    override=True)
     return table, selected
 
 
@@ -218,8 +265,11 @@ def main(argv=None):
         planned = None if args.keep_home else reference_plan(parser, args)
         rom_table, rom_images = ({}, {})
         if args.layout == 'dual':
-            rom_table, rom_images = verify_rom(parser, args.rom_dir)
+            rom_table, rom_images = verify_rom(parser, args.rom_dir, args.android_boot)
             print('Stock ROM verified against the pinned ' + rom_table['rom'] + ' checksums')
+            if args.android_boot is not None:
+                print('Android boot image override: ' + str(args.android_boot.resolve()))
+                print('  sha256 ' + rom_images['boot.img']['sha256'])
     else:
         restore = restore.resolve()
         if not (restore / 'gpt/manifest.json').is_file():
@@ -274,6 +324,12 @@ def main(argv=None):
             if args.layout == 'dual':
                 print('Android keeps slot A and its own userdata; Ubuntu installs into slot B.')
                 print('Android 保留 A 槽与独立的 userdata；Ubuntu 安装到 B 槽。')
+                if args.android_boot is not None:
+                    print('The Android slot will boot the supplied image instead of the stock '
+                          'boot.img:')
+                    print('  ' + str(args.android_boot.resolve()))
+                    print('  sha256 ' + rom_images['boot.img']['sha256'])
+                    print('Android 侧将启动上述替换镜像，而非原厂 boot.img。')
             if input('Type YES to continue / 输入 YES 继续: ') != 'YES':
                 parser.error('data erasure was not confirmed —— 未确认，已取消')
     server = None
@@ -386,7 +442,8 @@ def main(argv=None):
         else:
             raise RuntimeError('Return to Fastboot not observed; boot partition was not flashed')
         for name, entry in flashes:
-            print(f'Writing the stock {name} to {entry["partition"]}...', flush=True)
+            source = 'supplied' if entry.get('override') else 'stock'
+            print(f'Writing the {source} {name} to {entry["partition"]}...', flush=True)
             fastboot('flash', entry['partition'], str(entry['path']))
         print('Writing the matching boot image to boot_' + UBUNTU_SLOT + '...', flush=True)
         fastboot('flash', 'boot_' + UBUNTU_SLOT, str(bundle / 'boot.img'))
@@ -511,6 +568,12 @@ def stock_images_to_flash(device_layout, images):
     """
     selected = []
     for name, entry in sorted(images.items()):
+        if entry.get('override'):
+            # An override is what the operator asked for; it is written whether
+            # or not the partition already carries those bytes.
+            print(f'{name}: supplied override, will be written to {entry["partition"]}')
+            selected.append((name, entry))
+            continue
         if entry.get('sparse'):
             # An Android sparse image cannot be compared against the raw
             # partition, so it is always written when the dual layout asks for it.

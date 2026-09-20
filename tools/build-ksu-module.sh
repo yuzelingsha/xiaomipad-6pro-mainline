@@ -12,7 +12,7 @@ out_dir=${OUT_DIR:-"$project_root/out/ksu-module"}
 die() { printf 'build-ksu-module: %s\n' "$*" >&2; exit 1; }
 
 [ -d "$module_dir" ] || die "module directory is missing: $module_dir"
-for required in module.prop webroot/index.html system/bin/boot-ubuntu README.md; do
+for required in module.prop webroot/index.html system/bin/boot-ubuntu service.sh README.md; do
 	[ -f "$module_dir/$required" ] || die "module is missing $required"
 done
 command -v python3 >/dev/null || die 'python3 is required'
@@ -23,6 +23,7 @@ case $module_id in ''|*[!a-zA-Z0-9_]*) die "module.prop has no usable id: $modul
 case $module_version in ''|*[!a-zA-Z0-9._-]*) die "module.prop has no usable version: $module_version" ;; esac
 
 sh -n "$module_dir/system/bin/boot-ubuntu" || die 'boot-ubuntu is not valid sh'
+sh -n "$module_dir/service.sh" || die 'service.sh is not valid sh'
 
 mkdir -p "$out_dir"
 zip_path=$out_dir/$module_id-$module_version.zip

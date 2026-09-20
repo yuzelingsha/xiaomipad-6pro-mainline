@@ -148,3 +148,58 @@ with tempfile.TemporaryDirectory() as directory:
         refused = subprocess.run(base + extra, capture_output=True)
         assert refused.returncode != 0 and fragment in refused.stderr, (extra, refused.stderr)
 print('PASS: layout, ROM and restore argument combinations are checked before any device access')
+
+# The Android boot override replaces a checksum-pinned stock image, so its own
+# admission rules are checked offline, before any device is contacted.
+pinned = json.loads((project / 'tools/lib/liuqin-rom-images.json').read_text())
+stock_boot_bytes = pinned['images']['boot.img']['bytes']
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    files = {}
+    for name in ('boot.img', 'installer.img', 'rootfs.tar.gz'):
+        (root / name).write_bytes(name.encode())
+        files[name] = hashlib.sha256(name.encode()).hexdigest()
+    (root / 'bundle.json').write_text(json.dumps({'device': 'liuqin', 'files': files,
+                                                  'status': 'OFFLINE_ASSEMBLED'}))
+    good = root / 'android-boot-good.img'
+    good.write_bytes(b'ANDROID!' + bytes(stock_boot_bytes - 8))
+    short = root / 'android-boot-short.img'
+    short.write_bytes(b'ANDROID!' + bytes(stock_boot_bytes - 9))
+    wrong_magic = root / 'android-boot-magic.img'
+    wrong_magic.write_bytes(b'NOTABOOT' + bytes(stock_boot_bytes - 8))
+    check = ['python3', str(project / 'tools/install-liuqin.py'), '--bundle', str(root), '--check']
+    for extra, fragment in (
+            (['--layout', 'dual', '--android-boot', str(short)], b'exactly'),
+            (['--layout', 'dual', '--android-boot', str(wrong_magic)], b'Android boot magic'),
+            (['--layout', 'dual', '--android-boot', str(root / 'absent.img')], b'not a file'),
+            (['--layout', 'linux-only', '--android-boot', str(good)], b'only applies to --layout dual'),
+            (['--android-boot', str(good)], b'only applies to --layout dual')):
+        refused = subprocess.run(check + extra, capture_output=True)
+        assert refused.returncode != 0 and fragment in refused.stderr, (extra, refused.stderr)
+    accepted = subprocess.run(check + ['--layout', 'dual', '--android-boot', str(good)],
+                              capture_output=True)
+    assert accepted.returncode == 0, accepted.stderr
+    restore = subprocess.run(check + ['--restore-partition-table', str(root),
+                                      '--android-boot', str(good)], capture_output=True)
+    assert restore.returncode != 0 and b'separate action' in restore.stderr, restore.stderr
+print('PASS: the Android boot override is refused unless it is a dual-layout, '
+      'partition-sized Android boot image')
+
+# The override must replace the stock boot.img only after every other stock
+# image has been verified, and must always be written.
+with tempfile.TemporaryDirectory() as directory:
+    rom = Path(directory) / 'images'
+    rom.mkdir(parents=True)
+    for name, entry in pinned['images'].items():
+        (rom / name).write_bytes(b'')
+    parser, args = installer.parse_arguments(
+        ['--bundle', str(rom), '--layout', 'dual', '--rom-dir', str(rom.parent)])
+    refused = []
+    with patch.object(parser, 'error', side_effect=lambda message: refused.append(message)
+                      or (_ for _ in ()).throw(SystemExit(2))):
+        try:
+            installer.verify_rom(parser, rom.parent)
+        except SystemExit:
+            pass
+    assert refused and 'does not match the pinned' in refused[0], refused
+print('PASS: a ROM directory whose images do not match the pinned release is refused')
