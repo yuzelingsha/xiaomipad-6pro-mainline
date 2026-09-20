@@ -105,6 +105,7 @@ slot_from_cmdline() {
 storage_dev_root=${LIUQIN_STORAGE_DEV_ROOT:-/dev}
 storage_sys_block=${LIUQIN_STORAGE_SYS_BLOCK:-/sys/class/block}
 storage_mounts=${LIUQIN_STORAGE_MOUNTS:-/proc/mounts}
+storage_installer_marker=${LIUQIN_STORAGE_INSTALLER_MARKER:-/etc/liuqin-installer}
 storage_probe_root=${LIUQIN_STORAGE_PROBE_ROOT:-/mnt/persistent-root}
 storage_newroot=${LIUQIN_STORAGE_NEWROOT:-/newroot}
 storage_target_name=
@@ -1033,25 +1034,47 @@ if [ -z "$udc_name" ]; then
 	done
 fi
 
+# boot_a/boot_b/persist are the partitions the installer host side needs before
+# it will do anything, so a missing one is still fatal.  The data partitions are
+# not: a Linux-only install (--android-size 0) deletes userdata, and
+# linux_root/linux_home exist only after a layout has been written.  Refusing on
+# those would leave exactly the install that needs --restore-partition-table
+# without the telnet channel to run it from.  An optional partition that does
+# exist is held to the same standard as a required one -- resolvable to a single
+# block node and still read-only -- because a writable node here means the
+# fail-closed baseline did not take.
+storage_installer_required='boot_a boot_b persist'
+storage_installer_optional='userdata linux_root linux_home'
+
 start_stage1_telnet() {
 	if [ "$ufs_safe" = true ]; then
-		if [ -f /etc/liuqin-installer ]; then
-			mkdir -p /dev/disk/by-partlabel || return 1
-			for label in boot_a boot_b persist userdata; do
+		if [ -f "$storage_installer_marker" ]; then
+			mkdir -p "$storage_dev_root/disk/by-partlabel" || return 1
+			storage_installer_linked=
+			for label in $storage_installer_required $storage_installer_optional; do
 				target=
-				for info in /sys/class/block/sd*/uevent; do
+				for info in "$storage_sys_block"/sd*/uevent; do
 					if "$BB" grep -qx "PARTNAME=$label" "$info"; then
 						[ -z "$target" ] || { log "duplicate installer partition: $label"; return 1; }
 						node=${info%/uevent}; node=${node##*/}
-						target=/dev/$node
+						target=$storage_dev_root/$node
 					fi
 				done
-				[ -n "$target" ] && [ -b "$target" ] &&
+				if [ -z "$target" ]; then
+					case " $storage_installer_optional " in
+					*" $label "*) continue ;;
+					esac
+				fi
+				[ -n "$target" ] && storage_path_is_block "$target" &&
 					[ "$("$BB" blockdev --getro "$target")" = 1 ] || {
 						log "installer partition missing or writable: $label"; return 1;
 					}
-				ln -s "$target" "/dev/disk/by-partlabel/$label" || return 1
+				ln -s "$target" "$storage_dev_root/disk/by-partlabel/$label" || return 1
+				case " $storage_installer_optional " in
+				*" $label "*) storage_installer_linked="$storage_installer_linked $label" ;;
+				esac
 			done
+			log "installer data partitions linked:${storage_installer_linked:- none}"
 		fi
 		log "development-only unauthenticated shell: telnet 192.168.7.2 2323"
 		telnetd -b 192.168.7.2:2323 -l /bin/sh

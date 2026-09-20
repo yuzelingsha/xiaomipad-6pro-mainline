@@ -1195,4 +1195,145 @@ grep -q '^	storage_partlabel_link=\$storage_dev_root/disk/by-partlabel/linux_roo
 grep -q 'findfs LABEL=LIUQIN_ROOT' "$init" ||
 	fail "root resolution no longer confirms LABEL=LIUQIN_ROOT"
 
+# --------------------------------------------------------------------------
+# Installer-mode /dev/disk/by-partlabel: boot_a/boot_b/persist are required,
+# userdata/linux_root/linux_home are optional.  A Linux-only install deletes
+# userdata and a fresh device has no linux_root, and either case must still get
+# a telnet channel -- that is the channel --restore-partition-table runs from.
+# --------------------------------------------------------------------------
+installer_root=$test_root/installer
+sed -n '/^storage_path_is_block() {$/,/^}$/p' "$init" >"$installer_root.fn1"
+sed -n '/^storage_installer_required=/,/^}$/p' "$init" >"$installer_root.fn2"
+[ -s "$installer_root.fn1" ] && [ -s "$installer_root.fn2" ] ||
+	fail "could not extract the installer by-partlabel helpers from init"
+grep -q '^storage_installer_required=.boot_a boot_b persist.$' "$init" ||
+	fail "installer required partition set changed"
+grep -q '^storage_installer_optional=.userdata linux_root linux_home.$' "$init" ||
+	fail "installer optional partition set changed"
+
+# $1 case name, $2 writable node suffix or empty, rest: PARTNAME values
+installer_run() {
+	installer_name=$1; installer_writable=$2; shift 2
+	installer_case=$installer_root/$installer_name
+	rm -rf "$installer_case"
+	mkdir -p "$installer_case/dev" "$installer_case/sys" "$installer_case/etc"
+	: >"$installer_case/etc/liuqin-installer"
+	installer_index=10
+	for installer_label in "$@"; do
+		installer_index=$((installer_index + 1))
+		mkdir -p "$installer_case/sys/sda$installer_index"
+		printf 'PARTNAME=%s\n' "$installer_label" \
+			>"$installer_case/sys/sda$installer_index/uevent"
+		: >"$installer_case/dev/sda$installer_index"
+		[ "$installer_label" != "$installer_writable" ] ||
+			printf '%s\n' "sda$installer_index" >"$installer_case/writable"
+	done
+	cat >"$installer_case/bb" <<'INSTALLER_BB'
+#!/bin/sh
+installer_bb_cmd=$1; shift
+case $installer_bb_cmd in
+grep) exec grep "$@" ;;
+blockdev)
+	installer_bb_node=${2##*/}
+	if [ -r "$INSTALLER_WRITABLE_FILE" ] &&
+		[ "$(cat "$INSTALLER_WRITABLE_FILE")" = "$installer_bb_node" ]; then
+		printf '0\n'
+	else
+		printf '1\n'
+	fi
+	;;
+*) exit 2 ;;
+esac
+INSTALLER_BB
+	chmod 0755 "$installer_case/bb"
+	{
+		printf 'BB=%s\n' "$installer_case/bb"
+		printf 'ufs_safe=true\n'
+		printf 'storage_dev_root=%s\n' "$installer_case/dev"
+		printf 'storage_sys_block=%s\n' "$installer_case/sys"
+		printf 'storage_installer_marker=%s\n' "$installer_case/etc/liuqin-installer"
+		printf 'log() { printf "log: %%s\\n" "$*"; }\n'
+		printf 'telnetd() { printf "telnetd\\n"; }\n'
+		cat "$installer_root.fn1"
+		cat "$installer_root.fn2"
+		printf 'start_stage1_telnet\n'
+	} >"$installer_case/run.sh"
+	LIUQIN_INIT_STORAGE_TEST_ONLY=1 \
+		INSTALLER_WRITABLE_FILE="$installer_case/writable" \
+		"$host_busybox" sh "$installer_case/run.sh" >"$installer_case/out" 2>&1
+}
+
+installer_expect_ok() {
+	installer_expect_name=$1; shift
+	installer_run "$installer_expect_name" '' "$@" ||
+		fail "installer/$installer_expect_name: refused a usable layout"
+	grep -q '^telnetd$' "$installer_root/$installer_expect_name/out" ||
+		fail "installer/$installer_expect_name: telnet channel was not opened"
+}
+
+installer_expect_refused() {
+	installer_expect_name=$1; installer_expect_writable=$2; shift 2
+	if installer_run "$installer_expect_name" "$installer_expect_writable" "$@"; then
+		fail "installer/$installer_expect_name: accepted a layout it must refuse"
+	fi
+	! grep -q '^telnetd$' "$installer_root/$installer_expect_name/out" ||
+		fail "installer/$installer_expect_name: opened telnet after a refusal"
+}
+
+installer_linked() {
+	[ -L "$installer_root/$1/dev/disk/by-partlabel/$2" ]
+}
+
+# Every optional partition present: all six get a symlink.
+installer_expect_ok full boot_a boot_b persist userdata linux_root linux_home
+for installer_label in boot_a boot_b persist userdata linux_root linux_home; do
+	installer_linked full "$installer_label" ||
+		fail "installer/full: $installer_label was not linked"
+done
+grep -q '^log: installer data partitions linked: userdata linux_root linux_home$' \
+	"$installer_root/full/out" || fail "installer/full: optional link log is wrong"
+
+# Bare device, nothing but the required three: still a telnet channel.
+installer_expect_ok bare boot_a boot_b persist
+for installer_label in boot_a boot_b persist; do
+	installer_linked bare "$installer_label" ||
+		fail "installer/bare: $installer_label was not linked"
+done
+for installer_label in userdata linux_root linux_home; do
+	! installer_linked bare "$installer_label" ||
+		fail "installer/bare: $installer_label was linked but does not exist"
+done
+grep -q '^log: installer data partitions linked: none$' "$installer_root/bare/out" ||
+	fail "installer/bare: optional link log is wrong"
+
+# A Linux-only install (--android-size 0) has no userdata at all.
+installer_expect_ok linux-only boot_a boot_b persist linux_root linux_home
+! installer_linked linux-only userdata ||
+	fail "installer/linux-only: userdata was linked but does not exist"
+installer_linked linux-only linux_root ||
+	fail "installer/linux-only: linux_root was not linked"
+grep -q '^log: installer data partitions linked: linux_root linux_home$' \
+	"$installer_root/linux-only/out" || fail "installer/linux-only: optional link log is wrong"
+
+# The linux_root symlink has to agree with the uevent resolution, because
+# storage_resolve_target cross-checks exactly that node.
+installer_linked linux-only linux_root &&
+	[ "$(readlink "$installer_root/linux-only/dev/disk/by-partlabel/linux_root")" \
+		= "$installer_root/linux-only/dev/sda14" ] ||
+	fail "installer/linux-only: linux_root points at the wrong node"
+
+# Each required partition is fatal when missing; no optional one ever is.
+installer_expect_refused no-boot-a '' boot_b persist userdata
+installer_expect_refused no-boot-b '' boot_a persist userdata
+installer_expect_refused no-persist '' boot_a boot_b userdata
+installer_expect_ok no-userdata boot_a boot_b persist linux_root
+installer_expect_ok no-linux-root boot_a boot_b persist userdata
+installer_expect_ok no-linux-home boot_a boot_b persist userdata linux_root
+
+# Duplicates and writable nodes are refused whether the label is required or not.
+installer_expect_refused dup-required '' boot_a boot_a boot_b persist
+installer_expect_refused dup-optional '' boot_a boot_b persist linux_root linux_root
+installer_expect_refused rw-required persist boot_a boot_b persist
+installer_expect_refused rw-optional linux_root boot_a boot_b persist linux_root
+
 printf '%s\n' 'liuqin persistent-root fail-closed tests: PASS'
