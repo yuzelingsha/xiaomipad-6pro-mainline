@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Reboot to Android
+Name[zh_CN]=重启到 Android
+Comment=Make the stock Android slot active and restart the tablet
+Comment[zh_CN]=将原厂 Android slot 置为启动项并重启平板
+Exec=pkexec /usr/local/bin/liuqin-boot-android
+Icon=system-reboot
+Terminal=false
+Categories=System;
+Keywords=android;dualboot;slot;reboot;
+StartupNotify=false

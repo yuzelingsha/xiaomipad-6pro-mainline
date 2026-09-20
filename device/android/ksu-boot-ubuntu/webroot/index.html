@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Boot to Ubuntu</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f6f7;
+  --card: #ffffff;
+  --fg: #16181d;
+  --muted: #5c6270;
+  --line: #dcdfe5;
+  --accent: #b4441b;
+  --accent-fg: #ffffff;
+  --bad: #a11b1b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14161a;
+    --card: #1d2026;
+    --fg: #e9eaee;
+    --muted: #9aa1ae;
+    --line: #2e323a;
+    --accent: #d8622f;
+    --accent-fg: #14161a;
+    --bad: #f08a8a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 24px 16px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  display: flex;
+  justify-content: center;
+}
+main { width: 100%; max-width: 420px; }
+h1 { font-size: 1.4rem; margin: 0 0 4px; }
+p.lede { color: var(--muted); margin: 0 0 20px; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 18px;
+  margin-bottom: 16px;
+}
+dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; font-variant-numeric: tabular-nums; }
+button {
+  width: 100%;
+  padding: 15px 18px;
+  font: inherit;
+  font-weight: 600;
+  color: var(--accent-fg);
+  background: var(--accent);
+  border: 0;
+  border-radius: 12px;
+  cursor: pointer;
+}
+button[disabled] { opacity: .45; cursor: default; }
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 14px 0 0;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--muted);
+  font-size: .85rem;
+}
+.bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Boot to Ubuntu</h1>
+  <p class="lede">Android runs from slot A on this tablet, mainline Ubuntu from slot B.</p>
+
+  <div class="card">
+    <dl>
+      <dt>Slots</dt><dd id="slots">…</dd>
+      <dt>Current</dt><dd id="current">…</dd>
+    </dl>
+  </div>
+
+  <div class="card">
+    <button id="go" disabled>Reboot to Ubuntu</button>
+    <pre id="log">Checking the boot slots…</pre>
+  </div>
+</main>
+<script>
+// KernelSU WebUI exposes a single native bridge, ksu.exec(command, optionsJson,
+// callbackName): it runs the command as root and calls window[callbackName]
+// with (errno, stdout, stderr).  Wrapped in a promise here.
+let seq = 0;
+function exec(command) {
+  return new Promise((resolve, reject) => {
+    if (typeof ksu === 'undefined' || !ksu.exec) {
+      reject(new Error('KernelSU WebUI bridge is not available'));
+      return;
+    }
+    const name = '__ksu_cb_' + (seq++);
+    const timer = setTimeout(() => { delete window[name]; reject(new Error('timed out')); }, 15000);
+    window[name] = (errno, stdout, stderr) => {
+      clearTimeout(timer);
+      delete window[name];
+      resolve({ errno: Number(errno), stdout: String(stdout || ''), stderr: String(stderr || '') });
+    };
+    try {
+      ksu.exec(command, JSON.stringify({}), name);
+    } catch (error) {
+      clearTimeout(timer);
+      delete window[name];
+      reject(error);
+    }
+  });
+}
+
+const slotsEl = document.getElementById('slots');
+const currentEl = document.getElementById('current');
+const logEl = document.getElementById('log');
+const button = document.getElementById('go');
+
+function say(text, bad) {
+  logEl.textContent = text;
+  logEl.classList.toggle('bad', Boolean(bad));
+}
+
+async function refresh() {
+  try {
+    const slots = await exec('bootctl get-number-slots');
+    const current = await exec('bootctl get-current-slot');
+    const slotCount = slots.stdout.trim();
+    const currentSlot = current.stdout.trim();
+    slotsEl.textContent = slotCount || '?';
+    currentEl.textContent = currentSlot === '0' ? '0 (A, Android)'
+      : currentSlot === '1' ? '1 (B, Ubuntu)' : (currentSlot || '?');
+    if (slots.errno || current.errno) {
+      say('bootctl failed: ' + (slots.stderr || current.stderr || 'unknown error'), true);
+      return;
+    }
+    if (slotCount !== '2') {
+      say('This device does not report two boot slots; refusing.', true);
+      return;
+    }
+    if (currentSlot !== '0') {
+      say('Already running from slot B. Nothing to switch.', true);
+      return;
+    }
+    button.disabled = false;
+    say('Ready. The button sets slot B active and restarts the tablet.');
+  } catch (error) {
+    say(String(error && error.message ? error.message : error), true);
+  }
+}
+
+button.addEventListener('click', async () => {
+  if (!confirm('Set the active boot slot to B and restart into Ubuntu now?\n\nUnsaved work in Android will be lost.')) {
+    return;
+  }
+  button.disabled = true;
+  say('Switching slot…');
+  try {
+    const result = await exec('bootctl set-active-boot-slot 1 && sleep 1 && reboot');
+    if (result.errno) {
+      button.disabled = false;
+      say('Failed (errno ' + result.errno + '): ' + (result.stderr || result.stdout), true);
+      return;
+    }
+    say('Slot B is active. Rebooting…');
+  } catch (error) {
+    button.disabled = false;
+    say(String(error && error.message ? error.message : error), true);
+  }
+});
+
+refresh();
+</script>
+</body>
+</html>

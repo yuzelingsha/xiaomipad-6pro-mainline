@@ -73,6 +73,35 @@ case $storage_profile in
 		;;
 esac
 
+# Qualcomm A/B: which slot this boot came from.  ABL spells it
+# `androidboot.slot_suffix=_a`; a hand-written or QEMU cmdline may use the bare
+# `slot_suffix=_a`.  Both are accepted, they must agree, and the value must be
+# `_a` or `_b`.  On success slot_suffix is set to `a` or `b`; every other shape
+# -- key absent, value not a/b, two keys disagreeing -- clears it and fails, so
+# the caller can refuse to touch slot metadata it does not understand.
+slot_from_cmdline() {
+	slot_suffix=
+	slot_bad=0
+	set -f
+	for slot_word in $1; do
+		case $slot_word in
+		androidboot.slot_suffix=*) slot_value=${slot_word#androidboot.slot_suffix=} ;;
+		slot_suffix=*) slot_value=${slot_word#slot_suffix=} ;;
+		*) continue ;;
+		esac
+		case $slot_value in
+		_a) slot_value=a ;;
+		_b) slot_value=b ;;
+		*) slot_bad=1; continue ;;
+		esac
+		[ -z "$slot_suffix" ] || [ "$slot_suffix" = "$slot_value" ] || slot_bad=1
+		slot_suffix=$slot_value
+	done
+	set +f
+	[ "$slot_bad" = 0 ] && [ -n "$slot_suffix" ] || { slot_suffix=; return 1; }
+	return 0
+}
+
 storage_dev_root=${LIUQIN_STORAGE_DEV_ROOT:-/dev}
 storage_sys_block=${LIUQIN_STORAGE_SYS_BLOCK:-/sys/class/block}
 storage_mounts=${LIUQIN_STORAGE_MOUNTS:-/proc/mounts}
@@ -151,27 +180,40 @@ storage_source_is_mounted() {
 	return 1
 }
 
-# userdata carries the only writable persistent root.  Resolve it by PARTNAME
-# rather than a pinned partition number: liuqin capacity variants share the
-# first UFS LUN but not the exact GPT offsets.  Anything ambiguous (missing,
-# duplicated, or on another LUN) fails closed.
+# The writable persistent root is a whole partition on the first UFS LUN.  In
+# the dual-boot split layout it is `linux_root`; a single-system install still
+# hands over `userdata`.  Resolve it by PARTNAME rather than a pinned partition
+# number -- liuqin capacity variants share the LUN but not the exact GPT
+# offsets -- and prefer `linux_root` so a split layout never picks the Android
+# /data partition.  `/dev/disk/by-partlabel/linux_root` is the same information
+# by another name and only exists in installer mode, so it is used as a
+# cross-check, not as the source of truth.  Anything ambiguous (missing,
+# duplicated, on another LUN, or disagreeing with by-partlabel) fails closed.
 storage_resolve_target() {
 	storage_resolved_name=
-	for storage_uevent in "$storage_sys_block"/sd*/uevent; do
-		[ -r "$storage_uevent" ] || continue
-		[ "$(storage_uevent_value PARTNAME "$storage_uevent" 2>/dev/null || true)" = userdata ] || continue
-		storage_candidate=${storage_uevent%/uevent}
-		storage_candidate=${storage_candidate##*/}
-		case $storage_candidate in
-		sda[0-9]*) ;;
-		*) return 1 ;;
-		esac
-		[ -z "$storage_resolved_name" ] || return 1
-		storage_resolved_name=$storage_candidate
+	storage_resolved_partname=
+	for storage_partname in linux_root userdata; do
+		for storage_uevent in "$storage_sys_block"/sd*/uevent; do
+			[ -r "$storage_uevent" ] || continue
+			[ "$(storage_uevent_value PARTNAME "$storage_uevent" 2>/dev/null || true)" = "$storage_partname" ] || continue
+			storage_candidate=${storage_uevent%/uevent}
+			storage_candidate=${storage_candidate##*/}
+			case $storage_candidate in
+			sda[0-9]*) ;;
+			*) return 1 ;;
+			esac
+			[ -z "$storage_resolved_name" ] || return 1
+			storage_resolved_name=$storage_candidate
+		done
+		[ -z "$storage_resolved_name" ] || { storage_resolved_partname=$storage_partname; break; }
 	done
 	[ -n "$storage_resolved_name" ] || return 1
 	storage_target_name=$storage_resolved_name
 	storage_target=$storage_dev_root/$storage_target_name
+	storage_partlabel_link=$storage_dev_root/disk/by-partlabel/linux_root
+	if [ -e "$storage_partlabel_link" ]; then
+		[ "$("$BB" readlink -f "$storage_partlabel_link" 2>/dev/null || true)" = "$storage_target" ] || return 1
+	fi
 	return 0
 }
 
@@ -187,9 +229,18 @@ storage_identity_ok() {
 	case $storage_target_size in ''|*[!0-9]*) return 1 ;; esac
 	[ "$storage_target_size" -ge 33554432 ] || return 1
 
+	# The filesystem label is still the authority on "this is our root".
+	# PARTNAME only says which partition to look at; say which of the two
+	# routes named it, because a split-layout install that silently fell
+	# back to userdata is a misinstall, not a working boot.
 	storage_label_path=$("$BB" findfs LABEL=LIUQIN_ROOT 2>/dev/null || true)
 	[ -n "$storage_label_path" ] || return 1
 	[ "$("$BB" readlink -f "$storage_label_path" 2>/dev/null || true)" = "$storage_target" ] || return 1
+	if [ "$storage_resolved_partname" = linux_root ]; then
+		log "persistent root resolved via PARTNAME=linux_root ($storage_target), LABEL=LIUQIN_ROOT confirmed"
+	else
+		log "persistent root resolved via PARTNAME=userdata ($storage_target), LABEL=LIUQIN_ROOT confirmed"
+	fi
 	! storage_source_is_mounted "$storage_parent" || return 1
 	! storage_source_is_mounted "$storage_target" || return 1
 	return 0
@@ -763,6 +814,15 @@ storage_prepare_persistent_root() {
 	return 0
 }
 
+# LIUQIN_HOME (the optional linux_home partition) is deliberately NOT mounted
+# here.  The initramfs mounts exactly what it must verify before switch_root --
+# the root filesystem -- and everything it mounts it also has to move across
+# the switch and unwind on every failure path.  /home has no admission contract,
+# no marker and nothing in stage 1 needs it, so adding it would buy a second
+# ordering and rollback problem for nothing.  systemd in the real root mounts it
+# from /etc/fstab (the installer writes the LABEL=LIUQIN_HOME entry); if that
+# partition is missing or unlabelled the boot still reaches a shell with an empty
+# /home instead of failing in the initramfs.
 storage_switch_persistent_root() {
 	if ! storage_snapshot_persistent_ok "$storage_dev_root"; then
 		log "persistent root UFS state changed before switch_root"
@@ -1045,28 +1105,26 @@ fi
 if [ "$storage_mode" = persistent ] && [ "$ufs_safe" = true ]; then
 	if storage_prepare_persistent_root; then
 		slot_success_ok=true
-		case " $(cat /proc/cmdline) " in
-		*' androidboot.slot_suffix=_a '*)
-			if /bin/liuqin-mark-slot-successful --check-a; then
-				log "persistent root release: slot A was already successful"
-			elif /bin/liuqin-mark-slot-successful --mark-a &&
-				/bin/liuqin-mark-slot-successful --check-a; then
-				log "persistent root release: slot A marked successful"
+		# Mark the slot this boot actually came from.  Ubuntu lives in slot
+		# B once the dual-boot layout is in place and in slot A before it,
+		# so the suffix -- not a constant -- decides.  A cmdline without a
+		# usable suffix means the ABL A/B state cannot be reasoned about,
+		# and a persistent handoff that never marks the slot successful
+		# would be rolled back by the retry counter: refuse instead.
+		if slot_from_cmdline "$(cat /proc/cmdline)"; then
+			if /bin/liuqin-mark-slot-successful --check "$slot_suffix"; then
+				log "persistent root release: slot $slot_suffix was already successful"
+			elif /bin/liuqin-mark-slot-successful --mark "$slot_suffix" &&
+				/bin/liuqin-mark-slot-successful --check "$slot_suffix"; then
+				log "persistent root release: slot $slot_suffix marked successful"
 			else
-				log "critical: persistent root is valid but slot A success check/update failed"
+				log "critical: persistent root is valid but slot $slot_suffix success check/update failed"
 				slot_success_ok=false
 			fi
-			;;
-		*' androidboot.slot_suffix=_b '*)
-			log "critical: refusing a persistent root handoff while slot B is active"
+		else
+			log "critical: refusing a persistent root handoff without a usable androidboot.slot_suffix"
 			slot_success_ok=false
-			;;
-		*)
-			# QEMU/non-ABL integration tests have no Android slot suffix. They
-			# still exercise the storage contract but cannot update Qualcomm GPT attrs.
-			log "persistent root release: no Android slot suffix; slot-success update skipped"
-			;;
-		esac
+		fi
 		if [ "$slot_success_ok" != true ]; then
 			storage_abort || ufs_safe=false
 			[ "$ufs_safe" != true ] || [ ! -e /sys/class/net/usb0 ] || start_stage1_telnet
