@@ -16,9 +16,9 @@ Progress updates, usage tips and AI discussions (primarily in Chinese) are publi
 This project is only for the **Xiaomi Pad 6 Pro (liuqin, SM8475)**. Other Xiaomi Pad models are not compatible.
 
 - **Data loss**: unlocking the bootloader and performing an initial installation erase user data. Back up your files first.
-- **Storage and layout**: installation has been tested on one known **256 GB partition layout**, not every 256 GB device. Other capacities, modified partition layouts and slot-B installation are unverified and unsupported. Do not bypass the checks.
+- **Storage and layout**: installation has been tested on one known **256 GB partition layout**, not every 256 GB device. Other capacities and modified partition layouts are unverified and unsupported. The installer repartitions the tail of the disk and places Ubuntu in slot B. Do not bypass the checks.
 - **Validation scope**: initial installation, first boot, rotation, touch, the magnetic keyboard (including its touchpad), audio and USB OTG host mode (wired mouse) have been tested. Android recovery still requires separate device validation.
-- **Installation layout**: Ubuntu is installed as the sole operating system. Android dual boot is not provided.
+- **Installation layout**: the installer offers a Linux-only layout and a dual-boot layout that keeps a stock Android in slot A. The dual-boot layout is implemented but has not yet completed a device installation test; see the [installation steps](docs/INSTALL-TESTING.md).
 - **Recovery preparation**: obtain the matching stock firmware and read the [data and recovery instructions](docs/FLASHING.md#data-and-recovery) before installing.
 - **Hardware limitations**: some features are incomplete. Review the hardware support table below.
 
@@ -51,7 +51,7 @@ and device trees; other batches, capacities and accessory combinations are not i
 |---|---|---|---|
 | SoC / CPU | Qualcomm Snapdragon 8+ Gen 1 (SM8475), ARM64 | ✅ Working | Kernel boot and Ubuntu desktop; not all power states are validated |
 | GPU / compositing | Adreno 730 / Freedreno / Mesa | ✅ Working | Desktop acceleration; some applications need rendering workarounds |
-| Internal storage | UFS / ext4 | ✅ Working | Persistent system and packages; installer targets the known 256 GB layout only |
+| Internal storage | UFS / ext4 | ✅ Working | Persistent system and packages on `linux_root` and `linux_home`; installer targets the known 256 GB layout only |
 | Display | Novatek NT36532 / dual DSI / DSC | ✅ Working | 2880 x 1800 at 120 Hz; other refresh rates are not individually tested |
 | Manual brightness | Kinetic KTZ8866 backlight | ✅ Working | Backlight and manual brightness adjustment |
 | Touchscreen | Novatek NT36532 / SPI (CSOT or TM panel) | ✅ Working | Driver selects the firmware by panel module; touch input, swipes and gestures |

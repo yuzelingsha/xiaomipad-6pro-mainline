@@ -26,7 +26,10 @@ jobs:
           PY
       - name: Installer offline checks
         run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gdisk
           python3 tests/installer.py
+          python3 tests/installer-layout.py
           sudo python3 tests/rootfs-archive.py
       - name: Persistent-root fail-closed policy
         run: |

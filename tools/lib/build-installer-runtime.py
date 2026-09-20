@@ -24,7 +24,10 @@ def main():
                ('usr/bin/install', root / 'usr/bin/install'),
                ('usr/sbin/mkfs.ext4', root / 'usr/sbin/mkfs.ext4'),
                ('usr/sbin/e2fsck', root / 'usr/sbin/e2fsck'),
-               ('usr/sbin/getcap', root / 'usr/sbin/getcap')]
+               ('usr/sbin/getcap', root / 'usr/sbin/getcap'),
+               # The layout step edits the GPT on the device, so the partition
+               # editor has to be the distribution's, matched with its libuuid.
+               ('usr/sbin/sgdisk', root / 'usr/sbin/sgdisk')]
     files = {}
     while pending:
         relative, source = pending.pop()

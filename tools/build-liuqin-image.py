@@ -3,12 +3,49 @@
 """Assemble matching device packages, rootfs and boot from prepared inputs."""
 import argparse
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
 import shutil
 from pathlib import Path
 import subprocess
+
+
+# Files that decide what the installer writes to the tablet's storage: the
+# partition layout engine, the host driver and the two device-side scripts.
+# A change to any of them invalidates every earlier device test, because the
+# next bundle will lay the disk out differently from the one that was tested.
+INSTALLER_PATHS = ('tools/install-liuqin.py', 'tools/lib/liuqin_layout.py')
+INSTALLER_GLOB = 'tools/lib/install-*.sh'
+
+
+def installation_path_changes(project, env):
+    """List the installation-path files that changed since the last release tag.
+
+    Approach 4 of the dual-boot plan: a layout change must go through a full
+    attended installation, never an incremental one.  The rule is a build-time
+    assertion rather than a note in a document, because a note cannot fail a
+    release.
+    """
+    described = subprocess.run(['git', '-C', str(project), 'describe', '--tags', '--abbrev=0'],
+                               env=env, capture_output=True, text=True)
+    changed = set()
+    if described.returncode != 0:
+        # No release tag yet: nothing has been published, so nothing can be an
+        # increment on top of a tested bundle.  Require the mark explicitly.
+        changed.update(INSTALLER_PATHS)
+    else:
+        tag = described.stdout.strip()
+        listed = subprocess.check_output(
+            ['git', '-C', str(project), 'diff', '--name-only', tag + '..HEAD'], env=env, text=True)
+        dirty = subprocess.check_output(
+            ['git', '-C', str(project), 'status', '--porcelain', '--'], env=env, text=True)
+        listed += ''.join(line[3:] + '\n' for line in dirty.splitlines())
+        for path in listed.split():
+            if path in INSTALLER_PATHS or fnmatch.fnmatch(path, INSTALLER_GLOB):
+                changed.add(path)
+    return sorted(changed)
 
 
 INPUTS = {
@@ -89,6 +126,12 @@ def main():
         parser.error('another assembly owns this output')
     for stage in selected:
         if stage == 'release-assets':
+            changed = installation_path_changes(project, env)
+            if changed and not args.device_tested:
+                parser.error(
+                    'the installation path changed since the last release tag, so this bundle '
+                    'must be installed on a tablet and marked with --device-tested before it '
+                    'becomes a release asset:\n  ' + '\n  '.join(changed))
             destination = out / 'release-assets'
             shutil.copytree(out / 'bundle', destination,
                             ignore=shutil.ignore_patterns('rootfs.tar.gz'))
@@ -115,6 +158,8 @@ def main():
                      'installer.img': out / 'installer/boot-liuqin-native.img',
                      'rootfs.tar.gz': out / 'root/rootfs.tar.gz',
                      'install.py': project / 'tools/install-liuqin.py',
+                     'liuqin_layout.py': project / 'tools/lib/liuqin_layout.py',
+                     'liuqin-rom-images.json': project / 'tools/lib/liuqin-rom-images.json',
                      'INSTALL-TESTING.md': project / 'docs/INSTALL-TESTING.md',
                      'INSTALL-TESTING.zh-CN.md': project / 'docs/INSTALL-TESTING.zh-CN.md',
                      'NOTICE': project / 'NOTICE', 'LICENSE': project / 'LICENSE'}

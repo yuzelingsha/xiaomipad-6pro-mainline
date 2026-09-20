@@ -46,13 +46,15 @@ with tempfile.TemporaryDirectory() as directory:
                 return SimpleNamespace(stdout='booting\n')
             name = command[-1]
             values = {'product': 'liuqin', 'unlocked': 'yes', 'current-slot': 'a',
-                      'partition-size:userdata': reported, 'partition-size:boot_a': '0x10000000'}
+                      'partition-size:userdata': reported, 'partition-size:boot_a': '0x10000000',
+                      'partition-size:boot_b': '0x10000000'}
             return SimpleNamespace(stdout=name + ': ' + values[name] + '\n')
 
         stdin = SimpleNamespace(isatty=lambda: stdin_tty)
         with patch.object(installer.sys, 'argv', ['install.py', '--bundle', str(root),
                           '--serial', 'TEST_SERIAL', '--backup', str(root.parent / 'unused-backup'),
-                          '--erase-userdata', '--allow-unverified', *argv_extra]), \
+                          '--erase-userdata', '--allow-unverified', '--layout', 'linux-only',
+                          *argv_extra]), \
              patch.object(installer.subprocess, 'run', side_effect=fastboot), \
              patch.object(installer.sys, 'stdin', stdin), \
              patch('builtins.input', lambda *a: answer), \
@@ -65,10 +67,17 @@ with tempfile.TemporaryDirectory() as directory:
                 raise AssertionError('installation unexpectedly completed: ' + reported)
         return calls
 
-    for reported in ('0x100000', hex(8 * 1024**3), 'unknown'):
+    for reported in ('0x100000', hex(8 * 1024**3)):
         calls = run_install([], reported)
         assert calls[-1][-1] == 'partition-size:userdata', (reported, calls)
-    print('PASS: undersized and unknown userdata layouts are rejected before RAM boot')
+    print('PASS: undersized userdata layouts are rejected before RAM boot')
+
+    # A tablet whose userdata has already been replaced by a Linux-only split
+    # reports no userdata size at all.  That case is decided by the partition
+    # table itself, read in the RAM installer, not by this pre-boot probe.
+    calls = run_install(['--yes'], 'unknown')
+    assert calls[-1][3] == 'boot', calls
+    print('PASS: a tablet without userdata is referred to the on-device table check')
 
     for reported in (hex(16 * 1024**3), hex(471789528 * 512)):
         calls = run_install(['--yes'], reported)
@@ -106,7 +115,36 @@ thread.join()
 listener.close()
 assert subprocess.run(['sh', str(project / 'tools/lib/install-root.sh')], capture_output=True).returncode != 0
 invalid = subprocess.run(['sh', str(project / 'tools/lib/install-root.sh'),
-                          'unused', 'unused', 'unused', 'unused',
-                          'ERASE-LIUQIN-USERDATA', 'INVALID'], capture_output=True)
+                          'unused', 'unused', 'unused', 'unused', 'ERASE-LIUQIN-USERDATA',
+                          'linux_root', 'linux_home', 'INVALID'], capture_output=True)
 assert invalid.returncode != 0 and b'unsupported rescue option' in invalid.stderr
+unauthorized = subprocess.run(['sh', str(project / 'tools/lib/install-root.sh'),
+                               'unused', 'unused', 'unused', 'unused', 'NO',
+                               'linux_root', 'linux_home'], capture_output=True)
+assert unauthorized.returncode != 0 and b'data-erasure acknowledgement' in unauthorized.stderr
+for arguments in ([], ['id', 'report'], ['id', 'nonsense', 'x']):
+    refused = subprocess.run(['sh', str(project / 'tools/lib/install-layout.sh'), *arguments],
+                             capture_output=True)
+    assert refused.returncode != 0, arguments
 print('PASS: checksum rejection, local-only check, CRLF command framing and missing-authorization refusal')
+
+# Argument combinations that must never reach a device.
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    files = {}
+    for name in ('boot.img', 'installer.img', 'rootfs.tar.gz'):
+        (root / name).write_bytes(name.encode())
+        files[name] = hashlib.sha256(name.encode()).hexdigest()
+    (root / 'bundle.json').write_text(json.dumps({'device': 'liuqin', 'files': files,
+                                                  'status': 'OFFLINE_ASSEMBLED'}))
+    base = ['python3', str(project / 'tools/install-liuqin.py'), '--bundle', str(root),
+            '--serial', 'TEST_SERIAL', '--backup', str(root.parent / 'unused-backup'),
+            '--erase-userdata', '--allow-unverified', '--yes']
+    for extra, fragment in (
+            ([], b'--layout'),
+            (['--layout', 'dual'], b'--rom-dir'),
+            (['--layout', 'linux-only', '--rom-dir', str(root)], b'--rom-dir only applies'),
+            (['--layout', 'linux-only', '--restore-partition-table', str(root)], b'separate action')):
+        refused = subprocess.run(base + extra, capture_output=True)
+        assert refused.returncode != 0 and fragment in refused.stderr, (extra, refused.stderr)
+print('PASS: layout, ROM and restore argument combinations are checked before any device access')
