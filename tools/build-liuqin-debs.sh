@@ -274,7 +274,7 @@ PY
 	} >"$root/DEBIAN/postinst"
 	cp "$work/$pkg.preinst" "$root/DEBIAN/preinst"
 	cp "$work/$pkg.postrm" "$root/DEBIAN/postrm"
-	pack "$pkg" arm64 'libasound2t64 (>= 1.2), gnome-control-center (>= 1:50.0)' \
+	pack "$pkg" arm64 'libasound2t64 (>= 1.2), gnome-control-center (>= 1:50.0), gnome-snapshot, libcamera-ipa, gstreamer1.0-libcamera, gstreamer1.0-libav, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly' \
 		'Xiaomi Pad 6 Pro (liuqin) device support: units, helpers, rescue shell, power panel'
 }
 

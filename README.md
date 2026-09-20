@@ -83,7 +83,8 @@ and device trees; other batches, capacities and accessory combinations are not i
 | Other decoding formats | Iris / V4L2 | 🧪 Unverified | HEVC, VP9 and other formats not individually validated |
 | Browser hardware decoding | Browser / V4L2 integration | 🧪 Unverified | Video playback alone does not prove hardware decoding |
 | Hardware encoding | Qualcomm video engine | 🧪 Unverified | Hardware encoding workflows not tested |
-| Front and rear cameras | Qualcomm CAMSS / camera sensors | ❌ Unsupported | No working capture or application integration |
+| Rear camera | S5KJN1 / Qualcomm CAMSS / libcamera software ISP | 🟡 Partial | Preview and photos verified on a temporary boot; experimental video still stutters. See [camera validation and limitations](docs/CAMERA.md) |
+| Front camera | Camera sensor / CAMSS | ❌ Unsupported | Not enabled or validated |
 | Accelerometer / auto-rotation | SLPI / SSC / iio-sensor-proxy | ✅ Working | First boot, login screen, desktop rotation and magnetic-keyboard landscape use |
 | Gyroscope / magnetometer | SSC sensor path | 🧪 Unverified | Application-usable measurements not confirmed by accelerometer support |
 | Ambient light sensor | SSC light-sensor path | 🧪 Unverified | Real light measurements not fully validated |
