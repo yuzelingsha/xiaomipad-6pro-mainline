@@ -1,0 +1,6 @@
+id=liuqin_boot_ubuntu
+name=Boot to Ubuntu (liuqin)
+version=v0.1
+versionCode=1
+author=xiaomipad-6pro-mainline
+description=One button that makes slot B (mainline Ubuntu) the active boot slot and restarts the tablet. Android always lives in slot A on this device.
