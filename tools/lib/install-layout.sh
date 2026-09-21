@@ -4,6 +4,12 @@
 # read-only RAM image.  The host computes every layout decision and every
 # sgdisk argument; this script owns the guards, the privilege window and the
 # read-only posture that must hold before and after each write.
+#
+# Every helper below runs under `set -e`, so each one ends on a command whose
+# success status is the status the caller sees, and each resolution is bound to
+# a variable before it is used: a failure inside `$(...)` used as an argument is
+# invisible to the caller, and a trailing `command && die ...` reports the
+# absence of the failure as a failure of the helper.
 set -eu
 die() { printf 'liuqin-layout: %s\n' "$*" >&2; exit 1; }
 [ "$#" -ge 2 ] || die 'usage: install-layout.sh BOOT_ID VERB [ARGUMENT...]'
@@ -33,6 +39,7 @@ find_part() {
 
 parent_disk() {
 	node=${1##*/}
+	[ -n "$node" ] || die 'parent disk is unavailable'
 	path=$("$BB" readlink -f "/sys/class/block/$node/.." 2>/dev/null || true)
 	[ -n "$path" ] || die 'parent disk is unavailable'
 	disk=/dev/${path##*/}
@@ -41,25 +48,40 @@ parent_disk() {
 }
 
 sector_size() {
-	value=$(cat "/sys/class/block/${1##*/}/queue/logical_block_size")
+	value=$(cat "/sys/class/block/${1##*/}/queue/logical_block_size" 2>/dev/null || true)
 	case $value in ''|*[!0-9]*) die 'logical sector size is unavailable' ;; esac
+	[ "$value" -gt 0 ] || die 'logical sector size is unavailable'
 	printf '%s' "$value"
 }
 
 # /sys/class/block/*/size counts 512-byte units whatever the logical size is.
 sector_count() {
-	value=$(cat "/sys/class/block/${1##*/}/size")
+	value=$(cat "/sys/class/block/${1##*/}/size" 2>/dev/null || true)
 	case $value in ''|*[!0-9]*) die 'disk size is unavailable' ;; esac
-	printf '%s' "$(( value * 512 / $(sector_size "$1") ))"
+	unit=$(sector_size "$1")
+	printf '%s' "$(( value * 512 / unit ))"
 }
 
+# Size of a block device in bytes, from the same 512-byte-unit counter.
+byte_size() {
+	value=$(cat "/sys/class/block/${1##*/}/size" 2>/dev/null || true)
+	case $value in ''|*[!0-9]*) die 'partition size is unavailable' ;; esac
+	printf '%s' "$(( value * 512 ))"
+}
+
+# True only when nothing on the target disk is mounted.  The awk probe exits
+# non-zero for the ordinary case -- no mount found -- so it is consumed by an
+# `if`, never left as the status of the loop or of the function.
 assert_idle() {
 	for info in /sys/class/block/"${1##*/}"*/dev; do
 		[ -f "$info" ] || continue
 		number=$(cat "$info")
-		awk -v device="$number" '$3 == device {found=1} END {exit !found}' /proc/self/mountinfo &&
+		if awk -v device="$number" '$3 == device {found=1} END {exit !found}' \
+			/proc/self/mountinfo; then
 			die 'a partition of the target disk is mounted'
+		fi
 	done
+	return 0
 }
 
 # Restore the fail-closed posture the RAM image boots with: the whole disk and
@@ -72,51 +94,87 @@ seal() {
 		"$BB" blockdev --setro "/dev/${node##*/}" || die 'cannot restore the read-only flag'
 	done
 	"$BB" blockdev --setro "$1" || die 'cannot restore the read-only flag'
+	return 0
+}
+
+# sha256 of a byte range of a block device, as whole 4096-byte blocks.
+block_digest() {
+	digest=$("$BB" dd if="$1" bs=4096 skip="$2" count="$3" 2>/dev/null |
+		"$BB" sha256sum | "$BB" cut -d' ' -f1)
+	case $digest in
+	*[!0-9a-f]*|'') die 'reading the partition failed' ;;
+	esac
+	[ "${#digest}" = 64 ] || die 'reading the partition failed'
+	printf '%s' "$digest"
 }
 
 case $verb in
 disk)
 	[ "$#" = 1 ] || die 'usage: disk PARTNAME'
-	parent_disk "$(find_part "$1")"
+	part=$(find_part "$1")
+	parent_disk "$part"
 	printf '\n'
 	;;
 report)
 	[ "$#" = 1 ] || die 'usage: report PARTNAME'
-	"$SGDISK" -p "$(parent_disk "$(find_part "$1")")"
+	part=$(find_part "$1")
+	disk=$(parent_disk "$part")
+	"$SGDISK" -p "$disk" || die 'sgdisk cannot read the partition table'
 	;;
 info)
 	[ "$#" = 1 ] || die 'usage: info PARTNAME'
 	part=$(find_part "$1")
-	number=$(cat "/sys/class/block/${part##*/}/partition")
-	"$SGDISK" -i "$number" "$(parent_disk "$part")"
+	disk=$(parent_disk "$part")
+	number=$(cat "/sys/class/block/${part##*/}/partition" 2>/dev/null || true)
+	case $number in ''|*[!0-9]*) die 'partition number is unavailable' ;; esac
+	"$SGDISK" -i "$number" "$disk" || die 'sgdisk cannot read the partition entry'
 	;;
 geometry)
 	[ "$#" = 1 ] || die 'usage: geometry PARTNAME'
-	disk=$(parent_disk "$(find_part "$1")")
-	printf 'disk %s\nsector %s\nsectors %s\n' "$disk" "$(sector_size "$disk")" "$(sector_count "$disk")"
+	part=$(find_part "$1")
+	disk=$(parent_disk "$part")
+	sector=$(sector_size "$disk")
+	sectors=$(sector_count "$disk")
+	printf 'disk %s\nsector %s\nsectors %s\n' "$disk" "$sector" "$sectors"
 	;;
 backup-gpt)
 	# Both GPT copies of the disk: the protective MBR, primary header and
 	# primary entry array at the head, the entry array and backup header at
-	# the tail.  Six sectors each, as dumped by the P0 inventory.
+	# the tail.  Six sectors each, as dumped by the P0 inventory.  The copy is
+	# read into a file and its length checked before it is encoded, so a short
+	# read cannot become a backup that only looks complete.
 	[ "$#" = 2 ] || die 'usage: backup-gpt PARTNAME head|tail'
-	disk=$(parent_disk "$(find_part "$1")")
+	part=$(find_part "$1")
+	disk=$(parent_disk "$part")
 	sector=$(sector_size "$disk")
 	case $2 in
-	head) "$BB" dd if="$disk" bs="$sector" count=6 2>/dev/null | "$BB" base64 ;;
-	tail) "$BB" dd if="$disk" bs="$sector" skip="$(( $(sector_count "$disk") - 6 ))" count=6 2>/dev/null | "$BB" base64 ;;
+	head) skip=0 ;;
+	tail)
+		sectors=$(sector_count "$disk")
+		[ "$sectors" -gt 6 ] || die 'disk is too small to hold a GPT'
+		skip=$(( sectors - 6 ))
+		;;
 	*) die 'backup-gpt takes head or tail' ;;
 	esac
+	"$BB" dd if="$disk" of=/tmp/liuqin-gpt-read.bin bs="$sector" skip="$skip" \
+		count=6 2>/dev/null || die 'reading the GPT failed'
+	[ "$(stat -c %s /tmp/liuqin-gpt-read.bin)" = "$(( sector * 6 ))" ] ||
+		die 'the GPT copy is short'
+	"$BB" base64 </tmp/liuqin-gpt-read.bin || die 'encoding the GPT copy failed'
 	;;
 restore-gpt)
 	# The host has already staged the two verified copies as base64 files.
 	[ "$#" = 1 ] || die 'usage: restore-gpt PARTNAME'
-	disk=$(parent_disk "$(find_part "$1")")
+	part=$(find_part "$1")
+	disk=$(parent_disk "$part")
 	sector=$(sector_size "$disk")
+	sectors=$(sector_count "$disk")
+	[ "$sectors" -gt 6 ] || die 'disk is too small to hold a GPT'
 	assert_idle "$disk"
 	for half in head tail; do
 		[ -f "/tmp/liuqin-gpt-$half.b64" ] || die "staged GPT copy is missing: $half"
-		"$BB" base64 -d <"/tmp/liuqin-gpt-$half.b64" >"/tmp/liuqin-gpt-$half.bin"
+		"$BB" base64 -d <"/tmp/liuqin-gpt-$half.b64" >"/tmp/liuqin-gpt-$half.bin" ||
+			die "staged GPT copy does not decode: $half"
 		[ "$(stat -c %s "/tmp/liuqin-gpt-$half.bin")" = "$(( sector * 6 ))" ] ||
 			die "staged GPT copy has the wrong size: $half"
 	done
@@ -124,7 +182,7 @@ restore-gpt)
 	"$BB" dd if=/tmp/liuqin-gpt-head.bin of="$disk" bs="$sector" count=6 conv=notrunc 2>/dev/null ||
 		die 'writing the primary GPT failed'
 	"$BB" dd if=/tmp/liuqin-gpt-tail.bin of="$disk" bs="$sector" \
-		seek="$(( $(sector_count "$disk") - 6 ))" count=6 conv=notrunc 2>/dev/null ||
+		seek="$(( sectors - 6 ))" count=6 conv=notrunc 2>/dev/null ||
 		die 'writing the backup GPT failed'
 	sync
 	"$BB" blockdev --rereadpt "$disk" || true
@@ -134,14 +192,17 @@ restore-gpt)
 	;;
 wipe-head)
 	# Zero the head of a partition so that no stale filesystem superblock and
-	# no stale file-based-encryption key survives the layout change.
+	# no stale file-based-encryption key survives the layout change.  Whole
+	# mebibytes only: the write below counts in 1 MiB blocks, so any other
+	# length would round down and report a wipe that never happened.
 	[ "$#" = 2 ] || die 'usage: wipe-head PARTNAME BYTES'
 	part=$(find_part "$1")
 	case $2 in ''|*[!0-9]*) die 'invalid wipe length' ;; esac
 	[ "$2" -gt 0 ] && [ "$2" -le 67108864 ] || die 'wipe length is out of range'
+	[ "$(( $2 % 1048576 ))" = 0 ] || die 'wipe length must be a whole number of mebibytes'
 	disk=$(parent_disk "$part")
 	assert_idle "$disk"
-	size=$(( $(cat "/sys/class/block/${part##*/}/size") * 512 ))
+	size=$(byte_size "$part")
 	[ "$size" -gt "$2" ] || die 'partition is smaller than the requested wipe'
 	"$BB" blockdev --setrw "$disk" || die 'cannot open the disk for writing'
 	"$BB" blockdev --setrw "$part" || die 'cannot open the partition for writing'
@@ -157,7 +218,8 @@ apply)
 	[ "$#" -ge 2 ] || die 'usage: apply PARTNAME SGDISK-ARGUMENT...'
 	name=$1
 	shift
-	disk=$(parent_disk "$(find_part "$name")")
+	part=$(find_part "$name")
+	disk=$(parent_disk "$part")
 	assert_idle "$disk"
 	eval "target=\${$#}"
 	[ "$target" = "$disk" ] ||
@@ -184,13 +246,13 @@ digest)
 	part=$(find_part "$1")
 	case $2 in ''|*[!0-9]*) die 'invalid length' ;; esac
 	[ "$(( $2 % 4096 ))" = 0 ] || die 'length must be a whole number of 4096-byte blocks'
-	size=$(( $(cat "/sys/class/block/${part##*/}/size") * 512 ))
+	size=$(byte_size "$part")
 	[ "$size" -ge "$2" ] || die "$1 is smaller than the image"
+	content=$(block_digest "$part" 0 "$(( $2 / 4096 ))")
+	padding=$(block_digest "$part" "$(( $2 / 4096 ))" "$(( (size - $2) / 4096 ))")
 	printf 'size %s\n' "$size"
-	printf 'content %s\n' "$("$BB" dd if="$part" bs=4096 count="$(( $2 / 4096 ))" 2>/dev/null |
-		"$BB" sha256sum | "$BB" cut -d' ' -f1)"
-	printf 'padding %s\n' "$("$BB" dd if="$part" bs=4096 skip="$(( $2 / 4096 ))" \
-		count="$(( (size - $2) / 4096 ))" 2>/dev/null | "$BB" sha256sum | "$BB" cut -d' ' -f1)"
+	printf 'content %s\n' "$content"
+	printf 'padding %s\n' "$padding"
 	;;
 *)
 	die "unknown verb: $verb"

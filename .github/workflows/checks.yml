@@ -36,6 +36,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y busybox-static
           sh tests/persistent-root.sh
+      - name: Device-side layout script
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y busybox-static
+          sh tests/install-layout.sh
       - name: Sensor startup policy
         run: |
           sudo apt-get update
