@@ -32,6 +32,25 @@ trap cleanup EXIT HUP INT TERM
 fail() { printf 'test-liuqin-layout: %s\n' "$*" >&2; exit 1; }
 
 # --------------------------------------------------------------------------
+# Static check.  The installer RAM image is built from a fixed directory list
+# that contains no /tmp, so no script that runs inside it may name one: the
+# first backup-gpt on the tablet failed because dd could not create its output
+# there.  Every device-side script is checked, not just the one this suite
+# exercises.
+# --------------------------------------------------------------------------
+# Whole-line comments are stripped first: they may name the directory to
+# explain why it must not be used, and only code that runs on the tablet is
+# under test here.
+for device_script in tools/lib/install-layout.sh tools/lib/install-root.sh \
+	tools/provision-liuqin-from-persist.sh initramfs/init; do
+	[ -f "$project_root/$device_script" ] ||
+		fail "no such device-side script: $device_script"
+	! sed 's/^[[:space:]]*#.*$//' "$project_root/$device_script" |
+		grep -nE '/tmp([^a-zA-Z0-9_]|$)' ||
+		fail "$device_script names /tmp, which the installer RAM image does not have"
+done
+
+# --------------------------------------------------------------------------
 # Stub commands.  Only blockdev is simulated: it records the read-only flag of
 # each node in a state directory, which is what `seal` must leave behind.
 # --------------------------------------------------------------------------
@@ -90,6 +109,9 @@ devices=$case_root/devices
 state=$case_root/state
 mountinfo=$case_root/mountinfo
 command_log=$case_root/commands
+# The scratch directory the script must create for itself; its parent does not
+# exist either, so `mkdir -p` is the only thing that can bring it into being.
+work=$case_root/scratch/layout-work
 
 add_part() { # NAME INDEX MAJOR:MINOR SECTORS
 	mkdir -p "$devices/sda/sda$2"
@@ -104,8 +126,10 @@ add_part() { # NAME INDEX MAJOR:MINOR SECTORS
 
 reset_fixture() {
 	rm -rf "$case_root"
-	mkdir -p "$dev" "$sys" "$devices/sda/queue" "$case_root/etc" \
-		"$case_root/tmp" "$state"
+	# Deliberately no "tmp" directory: the installer RAM image has none, and
+	# the scratch directory below is left absent so that every run proves the
+	# script creates it for itself.
+	mkdir -p "$dev" "$sys" "$devices/sda/queue" "$case_root/etc" "$state"
 	printf '4096\n' >"$devices/sda/queue/logical_block_size"
 	printf '131072\n' >"$devices/sda/size"
 	printf '8:0\n' >"$devices/sda/dev"
@@ -160,17 +184,18 @@ build_script() {
 		s|/proc/self/mountinfo|$mountinfo|g
 		s|/proc/sys/kernel/random/boot_id|$case_root/boot_id|g
 		s|/etc/liuqin-installer|$case_root/etc/liuqin-installer|g
-		s|/tmp/liuqin-gpt-|$case_root/tmp/liuqin-gpt-|g
+		s|LIUQIN_LAYOUT_WORK:-/run/liuqin-layout|LIUQIN_LAYOUT_WORK:-$work|
 		s|^BB=/bin/busybox\$|BB=$bin/bb|
 		s|^SGDISK=/usr/sbin/sgdisk\$|SGDISK=$bin/sgdisk|
 		s|/dev/\${|$dev/\${|g
 		s|\[ -b |[ -e |g
 	" "$layout_source" >"$script"
 	for stale in '/sys/class/block' '/proc/self/mountinfo' '/bin/busybox' \
-		'/usr/sbin/sgdisk' '[ -b '; do
+		'/usr/sbin/sgdisk' '[ -b ' '/run/liuqin-layout'; do
 		! grep -qF "$stale" "$script" ||
 			fail "the fixture rewrite missed $stale; the script's paths changed"
 	done
+	grep -qF "$work" "$script" || fail 'the scratch-directory rewrite matched nothing'
 	grep -qF "if=/dev/zero" "$script" || fail 'the zero source was rewritten away'
 	grep -qF "$dev/\${" "$script" || fail 'the /dev rewrite matched nothing'
 
@@ -426,6 +451,7 @@ expect_output geometry-verb 'sector 4096'
 expect_output geometry-verb 'sectors 16384'
 
 reset_fixture
+[ ! -e "$work" ] || fail 'the fixture left a scratch directory behind'
 run_verb backup-gpt userdata head
 expect_ok backup-gpt-head
 printf '%s\n' "$output" | base64 -d >"$case_root/head.bin"
@@ -433,6 +459,11 @@ printf '%s\n' "$output" | base64 -d >"$case_root/head.bin"
 dd if="$dev/sda" bs=4096 count=6 of="$case_root/head.expected" 2>/dev/null
 cmp -s "$case_root/head.bin" "$case_root/head.expected" ||
 	fail 'backup-gpt head: did not return the head of the disk'
+# The directory the RAM image does not ship must be created by the script, and
+# the copy it read through must not survive the verb.
+[ -d "$work" ] || fail 'backup-gpt head: the scratch directory was not created'
+[ -z "$(ls -A "$work")" ] || fail 'backup-gpt head: left a temporary file behind'
+[ ! -e "$case_root/tmp" ] || fail 'backup-gpt head: wrote below /tmp'
 
 reset_fixture
 run_verb backup-gpt userdata tail
@@ -441,6 +472,59 @@ printf '%s\n' "$output" | base64 -d >"$case_root/tail.bin"
 dd if="$dev/sda" bs=4096 skip=16378 count=6 of="$case_root/tail.expected" 2>/dev/null
 cmp -s "$case_root/tail.bin" "$case_root/tail.expected" ||
 	fail 'backup-gpt tail: did not return the tail of the disk'
+[ -z "$(ls -A "$work")" ] || fail 'backup-gpt tail: left a temporary file behind'
+
+# --------------------------------------------------------------------------
+# restore-gpt, staged the way the host stages it: two base64 halves in the
+# same scratch directory, written into a corrupted disk image and compared
+# byte for byte.
+# --------------------------------------------------------------------------
+stage_halves() { # the pristine GPT regions, as base64 files
+	mkdir -p "$work"
+	dd if="$dev/sda" bs=4096 count=6 of="$case_root/head.expected" 2>/dev/null
+	dd if="$dev/sda" bs=4096 skip=16378 count=6 of="$case_root/tail.expected" 2>/dev/null
+	base64 <"$case_root/head.expected" >"$work/liuqin-gpt-head.b64"
+	base64 <"$case_root/tail.expected" >"$work/liuqin-gpt-tail.b64"
+}
+
+corrupt_gpt() {
+	dd if=/dev/zero bs=4096 count=6 2>/dev/null | tr '\000' 'X' |
+		dd of="$dev/sda" bs=4096 seek=0 conv=notrunc 2>/dev/null
+	dd if=/dev/zero bs=4096 count=6 2>/dev/null | tr '\000' 'Y' |
+		dd of="$dev/sda" bs=4096 seek=16378 conv=notrunc 2>/dev/null
+}
+
+reset_fixture
+stage_halves
+corrupt_gpt
+run_verb restore-gpt userdata
+expect_ok restore-gpt
+expect_output restore-gpt 'liuqin-layout: GPT_RESTORED'
+dd if="$dev/sda" bs=4096 count=6 of="$case_root/head.after" 2>/dev/null
+dd if="$dev/sda" bs=4096 skip=16378 count=6 of="$case_root/tail.after" 2>/dev/null
+cmp -s "$case_root/head.after" "$case_root/head.expected" ||
+	fail 'restore-gpt: the primary GPT was not restored'
+cmp -s "$case_root/tail.after" "$case_root/tail.expected" ||
+	fail 'restore-gpt: the backup GPT was not restored'
+[ "$(cat "$state/sda")" = 1 ] || fail 'restore-gpt: the disk was left writable'
+[ -z "$(ls -A "$work")" ] || fail 'restore-gpt: left the staged copies behind'
+[ ! -e "$case_root/tmp" ] || fail 'restore-gpt: wrote below /tmp'
+
+# Nothing staged is a refusal, not a write of whatever happens to be there.
+reset_fixture
+corrupt_gpt
+run_verb restore-gpt userdata
+expect_die restore-gpt-unstaged 'staged GPT copy is missing: head'
+! grep -q -- '--setrw' "$command_log" ||
+	fail 'restore-gpt-unstaged: opened the write window anyway'
+
+reset_fixture
+stage_halves
+: >"$work/liuqin-gpt-tail.b64"
+run_verb restore-gpt userdata
+expect_die restore-gpt-short 'staged GPT copy has the wrong size: tail'
+! grep -q -- '--setrw' "$command_log" ||
+	fail 'restore-gpt-short: opened the write window anyway'
 
 reset_fixture
 run_verb backup-gpt userdata middle

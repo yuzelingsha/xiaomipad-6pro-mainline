@@ -203,3 +203,21 @@ with tempfile.TemporaryDirectory() as directory:
             pass
     assert refused and 'does not match the pinned' in refused[0], refused
 print('PASS: a ROM directory whose images do not match the pinned release is refused')
+
+# The installer RAM image has no /tmp, so everything the host writes on the
+# tablet goes to the scratch directory the device script reads from -- and the
+# host creates that directory before writing into it, because the first
+# command it sends may well be this one.
+sent = []
+installer.stage_blob(lambda text, timeout=60: sent.append(text), 'head', b'liuqin')
+assert sent[0] == 'mkdir -p ' + installer.LAYOUT_WORK, sent
+staged = installer.LAYOUT_WORK + '/liuqin-gpt-head.b64'
+assert sent[1] == ':>' + staged, sent
+assert all('/tmp' not in text for text in sent), sent
+assert sent[2] == 'printf %s bGl1cWlu >>' + staged, sent
+assert sent[3] == 'printf "\\n" >>' + staged, sent
+assert installer.LAYOUT_WORK == '/run/liuqin-layout'
+# The device script must read the halves back from that same directory.
+layout_script = (project / 'tools/lib/install-layout.sh').read_text()
+assert 'LIUQIN_LAYOUT_WORK:-' + installer.LAYOUT_WORK in layout_script
+print('PASS: the staged partition-table halves land in the scratch directory the RAM image has')

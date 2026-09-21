@@ -22,6 +22,23 @@ BB=/bin/busybox
 SGDISK=/usr/sbin/sgdisk
 [ -x "$SGDISK" ] || die 'sgdisk is missing from the installer runtime'
 
+# Scratch space for the few verbs that need a file on disk.  The installer RAM
+# image has no /tmp -- it is built from a fixed directory list -- so nothing on
+# the device path may assume one: /run is the writable tmpfs the init script
+# mounts, and every temporary file this script writes lives in one directory
+# below it.  The directory is created here, before any verb runs, so a verb
+# never discovers a missing parent halfway through a partition operation, and
+# the host stages its blobs into the same directory.
+WORK=${LIUQIN_LAYOUT_WORK:-/run/liuqin-layout}
+mkdir -p "$WORK" || die 'cannot create the scratch directory'
+[ -d "$WORK" ] && [ -w "$WORK" ] || die 'the scratch directory is not writable'
+
+# Decoded copies are never inputs, so they can go at any exit; the staged
+# base64 halves are inputs the host wrote, and only restore-gpt removes them.
+cleanup() { rm -f "$WORK"/liuqin-gpt-read.bin "$WORK"/liuqin-gpt-head.bin \
+	"$WORK"/liuqin-gpt-tail.bin 2>/dev/null || :; }
+trap cleanup EXIT HUP INT TERM
+
 # Resolve a partition by PARTNAME.  /dev/disk/by-partlabel is built once at
 # boot from a fixed name list, so it cannot describe a table this script is
 # about to change; the sysfs uevent files always can.
@@ -156,11 +173,12 @@ backup-gpt)
 		;;
 	*) die 'backup-gpt takes head or tail' ;;
 	esac
-	"$BB" dd if="$disk" of=/tmp/liuqin-gpt-read.bin bs="$sector" skip="$skip" \
+	"$BB" dd if="$disk" of="$WORK/liuqin-gpt-read.bin" bs="$sector" skip="$skip" \
 		count=6 2>/dev/null || die 'reading the GPT failed'
-	[ "$(stat -c %s /tmp/liuqin-gpt-read.bin)" = "$(( sector * 6 ))" ] ||
+	[ "$(stat -c %s "$WORK/liuqin-gpt-read.bin")" = "$(( sector * 6 ))" ] ||
 		die 'the GPT copy is short'
-	"$BB" base64 </tmp/liuqin-gpt-read.bin || die 'encoding the GPT copy failed'
+	"$BB" base64 <"$WORK/liuqin-gpt-read.bin" || die 'encoding the GPT copy failed'
+	rm -f "$WORK/liuqin-gpt-read.bin" || die 'cannot remove the temporary GPT copy'
 	;;
 restore-gpt)
 	# The host has already staged the two verified copies as base64 files.
@@ -172,22 +190,27 @@ restore-gpt)
 	[ "$sectors" -gt 6 ] || die 'disk is too small to hold a GPT'
 	assert_idle "$disk"
 	for half in head tail; do
-		[ -f "/tmp/liuqin-gpt-$half.b64" ] || die "staged GPT copy is missing: $half"
-		"$BB" base64 -d <"/tmp/liuqin-gpt-$half.b64" >"/tmp/liuqin-gpt-$half.bin" ||
+		[ -f "$WORK/liuqin-gpt-$half.b64" ] || die "staged GPT copy is missing: $half"
+		"$BB" base64 -d <"$WORK/liuqin-gpt-$half.b64" >"$WORK/liuqin-gpt-$half.bin" ||
 			die "staged GPT copy does not decode: $half"
-		[ "$(stat -c %s "/tmp/liuqin-gpt-$half.bin")" = "$(( sector * 6 ))" ] ||
+		[ "$(stat -c %s "$WORK/liuqin-gpt-$half.bin")" = "$(( sector * 6 ))" ] ||
 			die "staged GPT copy has the wrong size: $half"
 	done
 	"$BB" blockdev --setrw "$disk" || die 'cannot open the disk for writing'
-	"$BB" dd if=/tmp/liuqin-gpt-head.bin of="$disk" bs="$sector" count=6 conv=notrunc 2>/dev/null ||
+	"$BB" dd if="$WORK/liuqin-gpt-head.bin" of="$disk" bs="$sector" count=6 conv=notrunc 2>/dev/null ||
 		die 'writing the primary GPT failed'
-	"$BB" dd if=/tmp/liuqin-gpt-tail.bin of="$disk" bs="$sector" \
+	"$BB" dd if="$WORK/liuqin-gpt-tail.bin" of="$disk" bs="$sector" \
 		seek="$(( sectors - 6 ))" count=6 conv=notrunc 2>/dev/null ||
 		die 'writing the backup GPT failed'
 	sync
 	"$BB" blockdev --rereadpt "$disk" || true
 	seal "$disk"
 	"$SGDISK" -v "$disk" || die 'the restored partition table does not verify'
+	# The staged halves have served their purpose; leaving them behind would
+	# let a later restore-gpt write a table nobody staged for it.
+	rm -f "$WORK/liuqin-gpt-head.b64" "$WORK/liuqin-gpt-tail.b64" \
+		"$WORK/liuqin-gpt-head.bin" "$WORK/liuqin-gpt-tail.bin" ||
+		die 'cannot remove the staged GPT copies'
 	printf 'liuqin-layout: GPT_RESTORED\n'
 	;;
 wipe-head)

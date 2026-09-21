@@ -498,9 +498,17 @@ def backup_partition_table(device_layout, directory, serial):
     return target
 
 
+# The installer RAM image is built from a fixed directory list that has no
+# /tmp, so anything the host writes on the device goes to the same scratch
+# directory tools/lib/install-layout.sh reads from, and the host creates it
+# before writing into it rather than assuming it is already there.
+LAYOUT_WORK = '/run/liuqin-layout'
+
+
 def stage_blob(remote, name, data):
     """Push a small verified blob to the RAM image in base64 chunks."""
-    path = '/tmp/liuqin-gpt-' + name + '.b64'
+    remote('mkdir -p ' + shlex.quote(LAYOUT_WORK))
+    path = LAYOUT_WORK + '/liuqin-gpt-' + name + '.b64'
     text = base64.b64encode(data).decode()
     remote(':>' + path)
     for index in range(0, len(text), 3000):

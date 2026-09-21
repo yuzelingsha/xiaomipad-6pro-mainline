@@ -44,7 +44,12 @@ mnt=$persist_src
 mounted_here=
 if [ -z "$mnt" ]; then
 	[ -b "$part" ] || die "persist partition is unavailable: $part"
-	mnt=$(mktemp -d /tmp/persist-ro.XXXXXX)
+	# Not below a temporary directory: this script also runs inside the RAM
+	# images, which are built from a fixed directory list that has none.
+	# /run is present and writable in every environment it runs in.
+	work=${LIUQIN_PROVISION_WORK:-/run}
+	mkdir -p "$work" || die "cannot create the scratch directory: $work"
+	mnt=$(mktemp -d "$work/persist-ro.XXXXXX")
 	mount -o ro "$part" "$mnt" || { rmdir "$mnt"; die "cannot mount $part read-only"; }
 	mounted_here=1
 fi
