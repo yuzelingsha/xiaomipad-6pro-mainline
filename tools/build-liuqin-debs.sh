@@ -217,12 +217,12 @@ PY
 		die 'device-support overlay copy is implausibly small'
 	# Adapt the shared storage guard to the native root marker.
 	guard=$root/usr/local/sbin/liuqin-gnome-storage-guard
-	grep -qx 'marker=/etc/liuqin-gnome-root' "$guard" ||
+	grep -qx 'marker=${LIUQIN_GNOME_GUARD_TEST_MARKER:-/etc/liuqin-gnome-root}' "$guard" ||
 		die 'storage guard drifted from the reviewed legacy marker'
 	grep -qx 'marker_sha=bd86a359f5b6bf05f09abf544967489e924c251ab7c07684df62b0dbda4c3fca' "$guard" ||
 		die 'storage guard drifted from the reviewed legacy marker hash'
 	sed -i \
-		-e 's|^marker=/etc/liuqin-gnome-root$|marker=/etc/liuqin-native-root|' \
+		-e 's|^marker=${LIUQIN_GNOME_GUARD_TEST_MARKER:-/etc/liuqin-gnome-root}$|marker=/etc/liuqin-native-root|' \
 		-e 's|^marker_sha=bd86a359f5b6bf05f09abf544967489e924c251ab7c07684df62b0dbda4c3fca$|marker_sha=4fdae4f7a27af8b0d4a2bbc168c7f01c3c5c6b5e245fcc521389d662f8212c5b|' \
 		"$guard"
 	grep -qx 'marker=/etc/liuqin-native-root' "$guard" ||

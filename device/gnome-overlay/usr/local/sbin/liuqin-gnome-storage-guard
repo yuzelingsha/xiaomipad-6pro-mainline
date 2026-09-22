@@ -1,14 +1,28 @@
 #!/usr/local/bin/busybox sh
 # SPDX-License-Identifier: MIT
 set -u
-BB=/usr/local/bin/busybox
-marker=/etc/liuqin-gnome-root
+# The LIUQIN_GNOME_GUARD_TEST_* overrides exist for the host-side fixture in
+# tests/storage-guard.sh.  systemd starts this script with a clean unit
+# environment, so on the device every default below applies unchanged.
+BB=${LIUQIN_GNOME_GUARD_TEST_BUSYBOX:-/usr/local/bin/busybox}
+marker=${LIUQIN_GNOME_GUARD_TEST_MARKER:-/etc/liuqin-gnome-root}
 marker_sha=bd86a359f5b6bf05f09abf544967489e924c251ab7c07684df62b0dbda4c3fca
+dev_root=${LIUQIN_GNOME_GUARD_TEST_DEV_ROOT:-/dev}
+mounts=${LIUQIN_GNOME_GUARD_TEST_MOUNTS:-/proc/mounts}
+kmsg=${LIUQIN_GNOME_GUARD_TEST_KMSG:-/dev/kmsg}
 
 fail() {
-	echo "liuqin-gnome-guard: critical: $*" >/dev/kmsg 2>/dev/null || :
+	echo "liuqin-gnome-guard: critical: $*" >"$kmsg" 2>/dev/null || :
 	$BB mount -o remount,ro / 2>/dev/null || :
 	exit 1
+}
+
+path_is_block() {
+	[ -b "$1" ] && return 0
+	# Host-side tests cannot create block nodes without privilege.  The bypass
+	# is reachable only together with the test BusyBox above, which the unit
+	# never sets.
+	[ -n "${LIUQIN_GNOME_GUARD_TEST_BUSYBOX:-}" ] && [ -f "$1" ]
 }
 
 [ -f "$marker" ] && [ ! -L "$marker" ] || fail 'root marker missing'
@@ -17,25 +31,46 @@ fail() {
 
 root_source=
 roots=0
+home_source=
+homes=0
 while IFS=' ' read -r source target fstype options _; do
-	[ "$target" = / ] || continue
-	roots=$((roots + 1))
-	# The initramfs already proved PARTNAME=userdata before switch_root; the
-	# exact partition number varies with the capacity variant, so here the rw
-	# pair is derived from the actual root mount on the first UFS LUN.
-	case $source in /dev/sda[0-9]*) ;; *) fail 'unexpected root source' ;; esac
-	[ "$fstype" = ext4 ] || fail 'unexpected root filesystem'
-	case ,$options, in *,rw,*) ;; *) fail 'root is not read-write' ;; esac
-	root_source=$source
-done </proc/mounts
+	case $target in
+	/)
+		roots=$((roots + 1))
+		# The initramfs already proved PARTNAME=userdata before switch_root; the
+		# exact partition number varies with the capacity variant, so here the rw
+		# pair is derived from the actual root mount on the first UFS LUN.
+		case $source in "$dev_root"/sda[0-9]*) ;; *) fail 'unexpected root source' ;; esac
+		[ "$fstype" = ext4 ] || fail 'unexpected root filesystem'
+		case ,$options, in *,rw,*) ;; *) fail 'root is not read-write' ;; esac
+		root_source=$source
+		;;
+	/home)
+		homes=$((homes + 1))
+		# The split layout mounts LABEL=LIUQIN_HOME at /home from fstab (nofail).
+		# This unit is ordered after local-fs.target, so the mount is final here
+		# and its node must stay read-write beside the root pair: sealing it
+		# again made systemd mount /home read-only and first-boot user creation
+		# fail.  Same admission rules as the root mount.
+		case $source in "$dev_root"/sda[0-9]*) ;; *) fail 'unexpected home source' ;; esac
+		[ "$fstype" = ext4 ] || fail 'unexpected home filesystem'
+		case ,$options, in *,rw,*) ;; *) fail 'home is not read-write' ;; esac
+		home_source=$source
+		;;
+	esac
+done <"$mounts"
 [ "$roots" = 1 ] || fail 'root mount is missing or duplicated'
+[ "$homes" -le 1 ] || fail 'home mount is duplicated'
+if [ -n "$home_source" ] && [ "$home_source" = "$root_source" ]; then
+	fail 'home and root share a source'
+fi
 
 total=0
-for node in /dev/sd*; do
-	[ -b "$node" ] || continue
+for node in "$dev_root"/sd*; do
+	path_is_block "$node" || continue
 	total=$((total + 1))
 	case $node in
-	/dev/sda|"$root_source")
+	"$dev_root/sda"|"$root_source"|"$home_source")
 		[ "$($BB blockdev --getro "$node" 2>/dev/null)" = 0 ] || fail "$node is unexpectedly read-only"
 		;;
 	*)
@@ -45,4 +80,8 @@ for node in /dev/sd*; do
 	esac
 done
 [ "$total" -ge 2 ] || fail 'no UFS namespace'
-echo "liuqin-gnome-guard: PASS ($total nodes; root pair rw, all siblings ro)" >/dev/kmsg 2>/dev/null || :
+if [ -n "$home_source" ]; then
+	echo "liuqin-gnome-guard: PASS ($total nodes; root and home pairs rw, all siblings ro)" >"$kmsg" 2>/dev/null || :
+else
+	echo "liuqin-gnome-guard: PASS ($total nodes; root pair rw, all siblings ro)" >"$kmsg" 2>/dev/null || :
+fi

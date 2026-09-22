@@ -4,6 +4,14 @@ DefaultDependencies=no
 # Stage 1 has already waited for, snapshotted and moved the complete /dev
 # namespace before systemd starts.  Waiting for udev-settle here duplicates
 # that gate and costs minutes under emulation without adding authority.
+#
+# The guard derives its read-write set from /proc/mounts, so every fstab mount
+# must be final before it runs: with no ordering against local-fs.target the
+# guard re-sealed linux_home seconds before systemd mounted the split layout's
+# /home (nofail), which then came up read-only and first-boot user creation
+# failed.  local-fs.target is ordered before sysinit.target and basic.target
+# is after sysinit.target, so this slot before basic.target adds no cycle.
+After=local-fs.target
 Before=basic.target network-pre.target display-manager.service
 
 [Service]
