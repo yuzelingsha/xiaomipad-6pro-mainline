@@ -11,7 +11,9 @@
 # and gnome-initial-setup could not create the user's home.  This suite runs
 # the real script under BusyBox ash (fallback: sh) against a synthetic mounts
 # table and a state-tracking blockdev stub, for both layouts and every invalid
-# /home shape.  The script's device paths stay at their shipped defaults; the
+# /home shape.  An invalid /home is not admitted and is sealed with the
+# siblings; it must never take the root down, because /home is nofail by
+# design and the initramfs deliberately leaves an unverified linux_home sealed.  The script's device paths stay at their shipped defaults; the
 # fixture reaches in only through the LIUQIN_GNOME_GUARD_TEST_* overrides.
 
 set -eu
@@ -45,15 +47,16 @@ fail() { printf 'test-liuqin-guard: %s\n' "$*" >&2; exit 1; }
 # --------------------------------------------------------------------------
 # Static drift checks.  The guard's root authority is the reviewed marker: its
 # hardcoded hash must be the real marker's hash.  The unit half of the split
-# /home fix is ordering: the guard must evaluate /proc/mounts only after every
-# fstab mount (including the nofail /home) is final, while staying ahead of
-# basic.target.
+# /home fix is ordering: the guard must evaluate /proc/mounts only after the
+# /home mount is final.  A nofail mount is not ordered before local-fs.target
+# (systemd.mount(5)), so home.mount has to be named explicitly; the guard also
+# stays ahead of basic.target.
 # --------------------------------------------------------------------------
 marker_sha=$(sha256sum "$real_marker" | cut -d' ' -f1)
 grep -q "^marker_sha=$marker_sha\$" "$guard_source" ||
 	fail 'the guard no longer pins the real marker content'
-grep -qx 'After=local-fs.target' "$guard_unit" ||
-	fail 'the guard unit is no longer ordered after local-fs.target'
+grep -qx 'After=local-fs.target home.mount' "$guard_unit" ||
+	fail 'the guard unit is no longer ordered after local-fs.target and home.mount'
 grep -qx 'Before=basic.target network-pre.target display-manager.service' "$guard_unit" ||
 	fail 'the guard unit lost its early-boot boundary'
 grep -qx 'DefaultDependencies=no' "$guard_unit" ||
@@ -168,6 +171,21 @@ expect_fail() { # NAME CRITICAL-MESSAGE
 		fail "$1: the root filesystem was not remounted read-only"
 }
 
+expect_degraded() { # NAME REASON
+	[ "$status" = 0 ] ||
+		fail "$1: the guard failed instead of degrading: $(cat "$kmsg")"
+	grep -qxF "liuqin-gnome-guard: warning: /home not admitted read-write: $2; sealing it with the siblings" "$kmsg" ||
+		fail "$1: expected the /home warning '$2', got: $(cat "$kmsg")"
+	grep -qxF 'liuqin-gnome-guard: PASS (6 nodes; root pair rw, all siblings ro)' "$kmsg" ||
+		fail "$1: expected the legacy PASS line, got: $(cat "$kmsg")"
+	if grep -q 'bb mount' "$command_log"; then
+		fail "$1: the root filesystem was remounted"
+	fi
+	assert_node sda 0 "$1"
+	assert_node sda35 0 "$1"
+	assert_node sda37 1 "$1"
+}
+
 assert_node() { # NODE EXPECTED-FLAG NAME
 	[ "$(cat "$state/$1")" = "$2" ] ||
 		fail "$3: $1 has read-only flag $(cat "$state/$1"), expected $2"
@@ -209,31 +227,44 @@ grep -q "bb blockdev --getro $dev/sda37\$" "$command_log" ||
 assert_never_sealed "$dev/sda37" split-valid
 assert_never_sealed "$dev/sda35" split-valid
 
-# --- A /home that is present but invalid fails closed ------------------------
+# --- A /home that is present but invalid is sealed, never fatal -----------
+# Each case starts from the split handoff (linux_home read-write), so the seal
+# of sda37 is visible work, and the root pair must stay read-write.
 split_fixture
 sed -i 's| /home ext4 rw,noatime | /home ext4 ro,noatime |' "$mounts"
 run_guard
-expect_fail home-read-only 'home is not read-write'
+expect_degraded home-read-only 'it is mounted read-only'
 
 split_fixture
 sed -i "s|$dev/sda37 /home|$dev/sdb1 /home|" "$mounts"
 run_guard
-expect_fail home-wrong-lun 'unexpected home source'
+expect_degraded home-wrong-lun "unexpected source $dev/sdb1"
 
 split_fixture
 sed -i 's| /home ext4 | /home xfs |' "$mounts"
 run_guard
-expect_fail home-wrong-fstype 'unexpected home filesystem'
+expect_degraded home-wrong-fstype 'unexpected filesystem xfs'
 
 split_fixture
 printf '%s /home ext4 rw,noatime 0 0\n' "$dev/sda36" >>"$mounts"
 run_guard
-expect_fail home-duplicated 'home mount is duplicated'
+expect_degraded home-duplicated 'the /home mount is duplicated'
 
 split_fixture
 sed -i "s|$dev/sda37 /home|$dev/sda35 /home|" "$mounts"
 run_guard
-expect_fail home-shares-root-source 'home and root share a source'
+expect_degraded home-shares-root-source 'it shares the root source'
+
+# --- Root anomalies still fail closed ----------------------------------------
+split_fixture
+sed -i "s|$dev/sda35 / ext4 rw,noatime|$dev/sda35 / ext4 ro,noatime|" "$mounts"
+run_guard
+expect_fail root-read-only 'root is not read-write'
+
+reset_fixture
+sed -i "s|$dev/sda35 / |$dev/sdb / |" "$mounts"
+run_guard
+expect_fail root-wrong-lun 'unexpected root source'
 
 # --- The root authority is still the marker ----------------------------------
 reset_fixture
