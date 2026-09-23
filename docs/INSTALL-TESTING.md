@@ -5,9 +5,12 @@ Initial installation and first boot have been tested on a 256 GB unit. The
 [installation guide](FLASHING.md) but have not been tested on real hardware.
 This remains an experimental device port. Keep the tablet attended and prepare a recovery plan.
 
-The dual-boot layout described below is implemented in the installer but has
-not yet completed a device installation test. Until a release marks it as
-device tested, treat it as an attended experiment.
+The dual-boot layout described below has been installed on a 256 GB unit: the
+partition table was split, Ubuntu was installed into `linux_root` with `/home`
+on `linux_home`, and Ubuntu boots from slot B. Android's first boot in slot A,
+KernelSU and switching between the two systems have not yet been validated on
+hardware. The Linux-only layout uses the same layout engine but has not been
+installed on hardware. Treat both as attended experiments.
 
 ## Installation Layouts
 
