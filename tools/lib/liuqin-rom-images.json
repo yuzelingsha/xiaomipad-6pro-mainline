@@ -1,0 +1,49 @@
+{
+  "comment": [
+    "Pinned identities of the stock Xiaomi Fastboot ROM images that the dual",
+    "layout writes to the Android slot.  These are checksums of a published",
+    "vendor package, not secrets: they exist so that the installer refuses a",
+    "ROM directory that is not the exact release this port was validated",
+    "against.  The ROM itself is an upstream input and is not redistributed",
+    "here.  'partition' is always the _a slot name (or the non-slotted super);",
+    "the installer never writes _b apart from boot_b with the project image.",
+    "'sparse' marks an Android sparse image, whose bytes cannot be compared",
+    "against the partition content, so it is always flashed when requested."
+  ],
+  "rom": "OS2.0.6.0.VMYCNXM",
+  "package": "liuqin_images_OS2.0.6.0.VMYCNXM_20250318.0000.00_15.0_cn",
+  "anti_version": 1,
+  "images": {
+    "boot.img": {
+      "partition": "boot_a",
+      "bytes": 201326592,
+      "sha256": "aa6060fc0e8f3612164dbcd260f4c8b3ef720d0d5d704d2db56e601a80e7c7bd"
+    },
+    "vendor_boot.img": {
+      "partition": "vendor_boot_a",
+      "bytes": 100663296,
+      "sha256": "ec4c6543c254873bd6490ca01185c90cd11f01d99e16c70008923c13d73feab7"
+    },
+    "dtbo.img": {
+      "partition": "dtbo_a",
+      "bytes": 25165824,
+      "sha256": "5e0377c7781e57f65c474f20edf3d7fb61f03f6030ca170e4edc29467a7993dd"
+    },
+    "vbmeta.img": {
+      "partition": "vbmeta_a",
+      "bytes": 8192,
+      "sha256": "e076dd1bd60d51032e952c32db0eb27ca42fd5e4306ae5b50a7e34b393e6e495"
+    },
+    "vbmeta_system.img": {
+      "partition": "vbmeta_system_a",
+      "bytes": 4096,
+      "sha256": "747152a24814e4aa37ef89c15ca69777218351e2d2f351168b9a6eb4bace70cf"
+    },
+    "super.img": {
+      "partition": "super",
+      "bytes": 7725176632,
+      "sha256": "e01baf61b4417921a5a856039bf712ed37d86d9279e08104020a38d69aa1647e",
+      "sparse": true
+    }
+  }
+}

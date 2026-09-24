@@ -1,0 +1,81 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Hand the next boot to the stock Android slot and reboot.
+#
+# The dual-boot layout is fixed: Android in slot A, Ubuntu in slot B.  This
+# command therefore only ever sets slot A active, and only from a slot B boot.
+# The irreversible part -- rewriting the Qualcomm A/B attribute bits in both
+# GPT copies on /dev/sde -- is done by the same C helper the initramfs uses,
+# which repeats every check below on its own and fails closed.
+#
+# Privilege: this runs as root.  The overlay's user-facing power paths are
+# unprivileged (liuqin-power-menu asks gnome-session-quit, which authorises
+# through polkit) and the only root path, liuqin-power-key-action, is started
+# by a root systemd unit and drops to the session user for the desktop calls.
+# Neither can be reused here: a GPT write needs real root and there is no
+# daemon already holding it.  So the desktop entry goes through pkexec, whose
+# admin prompt doubles as the confirmation for an irreversible write, and the
+# script refuses to do anything without uid 0.
+set -eu
+
+mark=${LIUQIN_MARK_SLOT:-/usr/local/libexec/liuqin-mark-slot-successful}
+cmdline=${LIUQIN_CMDLINE:-/proc/cmdline}
+boot_a=${LIUQIN_BOOT_A:-/dev/disk/by-partlabel/boot_a}
+systemctl=${LIUQIN_SYSTEMCTL:-/usr/bin/systemctl}
+id_cmd=${LIUQIN_ID:-/usr/bin/id}
+dd_cmd=${LIUQIN_DD:-/usr/bin/dd}
+dry_run=0
+
+die() { printf 'liuqin-boot-android: %s\n' "$*" >&2; exit 1; }
+
+case ${1:-} in
+'') ;;
+--dry-run) dry_run=1 ;;
+*) printf '%s\n' 'usage: liuqin-boot-android [--dry-run]' >&2; exit 64 ;;
+esac
+[ "$#" -le 1 ] || { printf '%s\n' 'usage: liuqin-boot-android [--dry-run]' >&2; exit 64; }
+
+[ "$("$id_cmd" -u)" = 0 ] ||
+	die 'must run as root; try: pkexec liuqin-boot-android'
+[ -x "$mark" ] || die "slot helper is missing or not executable: $mark"
+[ -r "$cmdline" ] || die "cannot read $cmdline"
+
+# Same acceptance as initramfs/init's slot_from_cmdline: both spellings, they
+# must agree, and the value must be _a or _b.
+slot=
+slot_bad=0
+set -f
+for word in $(cat "$cmdline"); do
+	case $word in
+	androidboot.slot_suffix=*) value=${word#androidboot.slot_suffix=} ;;
+	slot_suffix=*) value=${word#slot_suffix=} ;;
+	*) continue ;;
+	esac
+	case $value in
+	_a) value=a ;;
+	_b) value=b ;;
+	*) slot_bad=1; continue ;;
+	esac
+	[ -z "$slot" ] || [ "$slot" = "$value" ] || slot_bad=1
+	slot=$value
+done
+set +f
+[ "$slot_bad" = 0 ] && [ -n "$slot" ] ||
+	die 'no usable androidboot.slot_suffix on the kernel command line'
+[ "$slot" = b ] ||
+	die "this boot is slot $slot; Ubuntu only runs from slot b, so there is nothing to switch"
+
+[ -b "$boot_a" ] || die "boot_a is not a block device: $boot_a"
+magic=$("$dd_cmd" if="$boot_a" bs=1 count=8 2>/dev/null | tr -d '\000' || true)
+[ "$magic" = 'ANDROID!' ] ||
+	die 'boot_a does not start with the ANDROID! boot-image magic; refusing'
+
+if [ "$dry_run" = 1 ]; then
+	printf '%s\n' 'liuqin-boot-android: dry run: slot b is running and boot_a holds an Android boot image'
+	exit 0
+fi
+
+"$mark" --set-active a --i-know
+printf '%s\n' 'liuqin-boot-android: slot A is active; rebooting into Android'
+exec "$systemctl" reboot

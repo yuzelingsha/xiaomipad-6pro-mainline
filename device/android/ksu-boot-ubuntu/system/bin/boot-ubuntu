@@ -1,0 +1,58 @@
+#!/system/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Android -> Ubuntu on liuqin.  The dual-boot layout is fixed: Android in slot
+# A, mainline Ubuntu in slot B, so this only ever selects slot 1.  Nothing here
+# writes the GPT directly; bootctl (the vendor boot_control HAL) owns the A/B
+# attribute bits on the Android side.
+set -eu
+
+bootctl=${BOOTCTL:-/system/bin/bootctl}
+reboot_cmd=${REBOOT:-/system/bin/reboot}
+assume_yes=0
+
+usage() {
+	echo "usage: boot-ubuntu [-y] [-n]"
+	echo "  -y  do not ask for confirmation"
+	echo "  -n  check and report only; do not switch or reboot"
+}
+
+dry_run=0
+for arg in "$@"; do
+	case $arg in
+	-y) assume_yes=1 ;;
+	-n|--dry-run) dry_run=1 ;;
+	-h|--help) usage; exit 0 ;;
+	*) usage >&2; exit 64 ;;
+	esac
+done
+
+die() { echo "boot-ubuntu: $*" >&2; exit 1; }
+
+[ "$(id -u)" = 0 ] || die 'must run as root (su -c boot-ubuntu)'
+[ -x "$bootctl" ] || die "bootctl is missing: $bootctl"
+
+slots=$("$bootctl" get-number-slots 2>/dev/null || echo 0)
+[ "$slots" = 2 ] || die "this device does not report two boot slots (got: $slots)"
+current=$("$bootctl" get-current-slot 2>/dev/null || echo '')
+case $current in
+0) ;;
+1) die 'already running from slot B; there is nothing to switch' ;;
+*) die "bootctl did not report a usable current slot (got: $current)" ;;
+esac
+
+if [ "$dry_run" = 1 ]; then
+	echo "boot-ubuntu: running slot 0 (Android); slot 1 (Ubuntu) can be selected"
+	exit 0
+fi
+
+if [ "$assume_yes" != 1 ]; then
+	printf 'Switch the active boot slot to B (Ubuntu) and reboot now? [y/N] '
+	read -r answer || answer=
+	case $answer in y|Y|yes|YES) ;; *) echo 'boot-ubuntu: cancelled'; exit 0 ;; esac
+fi
+
+"$bootctl" set-active-boot-slot 1
+echo 'boot-ubuntu: slot B is active; rebooting'
+sleep 1
+exec "$reboot_cmd"

@@ -37,6 +37,7 @@ power_key_cc=${POWER_KEY_CC:-$(command -v aarch64-linux-gnu-gcc || true)}
 power_keyd_source=${POWER_KEYD_SOURCE:-"$project_root/device/power-key/liuqin-power-keyd.c"}
 uinput_automation_source=${UINPUT_AUTOMATION_SOURCE:-"$project_root/device/input/liuqin-uinput-automation.c"}
 audio_probe_source=${AUDIO_PROBE_SOURCE:-"$project_root/device/audio-topology/liuqin-audio-hwparams-probe.c"}
+slot_success_source=${SLOT_SUCCESS_SOURCE:-"$project_root/device/boot/liuqin-mark-slot-successful.c"}
 power_settings_binary=${POWER_SETTINGS_BINARY:-"$project_root/out/gnome-control-center/gnome-control-center"}
 power_settings_sha256=${POWER_SETTINGS_SHA256:-}
 power_settings_manifest=${POWER_SETTINGS_MANIFEST:-"$project_root/out/gnome-control-center/build-info.json"}
@@ -216,12 +217,12 @@ PY
 		die 'device-support overlay copy is implausibly small'
 	# Adapt the shared storage guard to the native root marker.
 	guard=$root/usr/local/sbin/liuqin-gnome-storage-guard
-	grep -qx 'marker=/etc/liuqin-gnome-root' "$guard" ||
+	grep -qx 'marker=${LIUQIN_GNOME_GUARD_TEST_MARKER:-/etc/liuqin-gnome-root}' "$guard" ||
 		die 'storage guard drifted from the reviewed legacy marker'
 	grep -qx 'marker_sha=bd86a359f5b6bf05f09abf544967489e924c251ab7c07684df62b0dbda4c3fca' "$guard" ||
 		die 'storage guard drifted from the reviewed legacy marker hash'
 	sed -i \
-		-e 's|^marker=/etc/liuqin-gnome-root$|marker=/etc/liuqin-native-root|' \
+		-e 's|^marker=${LIUQIN_GNOME_GUARD_TEST_MARKER:-/etc/liuqin-gnome-root}$|marker=/etc/liuqin-native-root|' \
 		-e 's|^marker_sha=bd86a359f5b6bf05f09abf544967489e924c251ab7c07684df62b0dbda4c3fca$|marker_sha=4fdae4f7a27af8b0d4a2bbc168c7f01c3c5c6b5e245fcc521389d662f8212c5b|' \
 		"$guard"
 	grep -qx 'marker=/etc/liuqin-native-root' "$guard" ||
@@ -252,6 +253,19 @@ PY
 		"$audio_probe_source" "$audio_probe_libasound" \
 		-o "$root/usr/local/libexec/liuqin-audio-hwparams-probe"
 	chmod 0755 "$root/usr/local/libexec/liuqin-audio-hwparams-probe"
+	# The A/B slot helper also ships in the initramfs, but liuqin-boot-android
+	# needs it in the running system at a stable path.  Static, like the
+	# initramfs copy: it may have to run when very little else works.
+	LC_ALL=C SOURCE_DATE_EPOCH=0 "$power_key_cc" \
+		-std=c11 -Os -pipe -static -Wall -Wextra -Werror -Wformat=2 \
+		-fstack-protector-strong -D_FORTIFY_SOURCE=3 \
+		-ffile-prefix-map="$project_root"=. -ffile-prefix-map="$root"=/build/liuqin-device-support \
+		-Wl,-z,relro,-z,now -Wl,--build-id=sha1 \
+		"$slot_success_source" -o "$root/usr/local/libexec/liuqin-mark-slot-successful"
+	chmod 0755 "$root/usr/local/libexec/liuqin-mark-slot-successful"
+	grep -qx 'mark=${LIUQIN_MARK_SLOT:-/usr/local/libexec/liuqin-mark-slot-successful}' \
+		"$root/usr/local/bin/liuqin-boot-android" ||
+		die 'liuqin-boot-android no longer points at the packaged slot helper'
 	command -v readelf >/dev/null || die 'readelf is required to verify generated executables'
 	[ "$(LC_ALL=C readelf -h "$root/usr/local/libexec/liuqin-power-keyd" |
 		sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')" = AArch64 ] ||

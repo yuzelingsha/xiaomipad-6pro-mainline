@@ -16,6 +16,15 @@ fi
 export PATH
 
 log() {
+	# Host tests enter the storage gate only (LIUQIN_INIT_STORAGE_TEST_ONLY)
+	# and have no console or kmsg to read back, so the mutation harness can
+	# redirect the log into a file.  Both gates must hold; the device path
+	# below is unchanged.
+	if [ "${LIUQIN_INIT_STORAGE_TEST_ONLY:-0}" = 1 ] &&
+		[ -n "${LIUQIN_INIT_TEST_LOG:-}" ]; then
+		echo "liuqin-initramfs: $*" >>"$LIUQIN_INIT_TEST_LOG" 2>/dev/null || true
+		return 0
+	fi
 	echo "liuqin-initramfs: $*" >/dev/console 2>/dev/null || true
 	echo "liuqin-initramfs: $*" >/dev/kmsg 2>/dev/null || true
 }
@@ -73,13 +82,45 @@ case $storage_profile in
 		;;
 esac
 
+# Qualcomm A/B: which slot this boot came from.  ABL spells it
+# `androidboot.slot_suffix=_a`; a hand-written or QEMU cmdline may use the bare
+# `slot_suffix=_a`.  Both are accepted, they must agree, and the value must be
+# `_a` or `_b`.  On success slot_suffix is set to `a` or `b`; every other shape
+# -- key absent, value not a/b, two keys disagreeing -- clears it and fails, so
+# the caller can refuse to touch slot metadata it does not understand.
+slot_from_cmdline() {
+	slot_suffix=
+	slot_bad=0
+	set -f
+	for slot_word in $1; do
+		case $slot_word in
+		androidboot.slot_suffix=*) slot_value=${slot_word#androidboot.slot_suffix=} ;;
+		slot_suffix=*) slot_value=${slot_word#slot_suffix=} ;;
+		*) continue ;;
+		esac
+		case $slot_value in
+		_a) slot_value=a ;;
+		_b) slot_value=b ;;
+		*) slot_bad=1; continue ;;
+		esac
+		[ -z "$slot_suffix" ] || [ "$slot_suffix" = "$slot_value" ] || slot_bad=1
+		slot_suffix=$slot_value
+	done
+	set +f
+	[ "$slot_bad" = 0 ] && [ -n "$slot_suffix" ] || { slot_suffix=; return 1; }
+	return 0
+}
+
 storage_dev_root=${LIUQIN_STORAGE_DEV_ROOT:-/dev}
 storage_sys_block=${LIUQIN_STORAGE_SYS_BLOCK:-/sys/class/block}
 storage_mounts=${LIUQIN_STORAGE_MOUNTS:-/proc/mounts}
+storage_installer_marker=${LIUQIN_STORAGE_INSTALLER_MARKER:-/etc/liuqin-installer}
 storage_probe_root=${LIUQIN_STORAGE_PROBE_ROOT:-/mnt/persistent-root}
 storage_newroot=${LIUQIN_STORAGE_NEWROOT:-/newroot}
 storage_target_name=
 storage_target=
+storage_home_name=
+storage_home=
 storage_parent=$storage_dev_root/sda
 storage_marker=etc/liuqin-persistent-root
 storage_marker_sha256=0d354b25a425dcc17da2c7a8bbdaae09274cecdb1f137c70630ebe5634fa9a48
@@ -151,27 +192,83 @@ storage_source_is_mounted() {
 	return 1
 }
 
-# userdata carries the only writable persistent root.  Resolve it by PARTNAME
-# rather than a pinned partition number: liuqin capacity variants share the
-# first UFS LUN but not the exact GPT offsets.  Anything ambiguous (missing,
-# duplicated, or on another LUN) fails closed.
+# The writable persistent root is a whole partition on the first UFS LUN.  In
+# the dual-boot split layout it is `linux_root`; a single-system install still
+# hands over `userdata`.  Resolve it by PARTNAME rather than a pinned partition
+# number -- liuqin capacity variants share the LUN but not the exact GPT
+# offsets -- and prefer `linux_root` so a split layout never picks the Android
+# /data partition.  `/dev/disk/by-partlabel/linux_root` is the same information
+# by another name and only exists in installer mode, so it is used as a
+# cross-check, not as the source of truth.  Anything ambiguous (missing,
+# duplicated, on another LUN, or disagreeing with by-partlabel) fails closed.
 storage_resolve_target() {
 	storage_resolved_name=
-	for storage_uevent in "$storage_sys_block"/sd*/uevent; do
-		[ -r "$storage_uevent" ] || continue
-		[ "$(storage_uevent_value PARTNAME "$storage_uevent" 2>/dev/null || true)" = userdata ] || continue
-		storage_candidate=${storage_uevent%/uevent}
-		storage_candidate=${storage_candidate##*/}
-		case $storage_candidate in
-		sda[0-9]*) ;;
-		*) return 1 ;;
-		esac
-		[ -z "$storage_resolved_name" ] || return 1
-		storage_resolved_name=$storage_candidate
+	storage_resolved_partname=
+	for storage_partname in linux_root userdata; do
+		for storage_uevent in "$storage_sys_block"/sd*/uevent; do
+			[ -r "$storage_uevent" ] || continue
+			[ "$(storage_uevent_value PARTNAME "$storage_uevent" 2>/dev/null || true)" = "$storage_partname" ] || continue
+			storage_candidate=${storage_uevent%/uevent}
+			storage_candidate=${storage_candidate##*/}
+			case $storage_candidate in
+			sda[0-9]*) ;;
+			*) return 1 ;;
+			esac
+			[ -z "$storage_resolved_name" ] || return 1
+			storage_resolved_name=$storage_candidate
+		done
+		[ -z "$storage_resolved_name" ] || { storage_resolved_partname=$storage_partname; break; }
 	done
 	[ -n "$storage_resolved_name" ] || return 1
 	storage_target_name=$storage_resolved_name
 	storage_target=$storage_dev_root/$storage_target_name
+	storage_partlabel_link=$storage_dev_root/disk/by-partlabel/linux_root
+	if [ -e "$storage_partlabel_link" ]; then
+		[ "$("$BB" readlink -f "$storage_partlabel_link" 2>/dev/null || true)" = "$storage_target" ] || return 1
+	fi
+	return 0
+}
+
+# In the split layout /home is its own `linux_home` partition, mounted by
+# systemd from the real root's fstab (LABEL=LIUQIN_HOME, nofail).  The
+# initramfs never mounts it, but the fail-closed baseline sealed every UFS node
+# with BLKROSET and that kernel-level read-only flag survives switch_root:
+# without clearing it systemd mounts /home read-only ("source write-protected,
+# mounted read-only") and nothing can create a user home directory.  Resolution
+# mirrors the root's -- PARTNAME on the first LUN, exactly one node, no alias,
+# cross-checked against the filesystem label -- and anything ambiguous leaves
+# the partition sealed.  Ambiguity here is not a boot failure: the fstab entry
+# is `nofail` by design, so a missing, duplicated or unlabelled home partition
+# must reach a desktop with /home on the root filesystem instead of no boot.
+storage_resolve_home() {
+	storage_home_name=
+	storage_home=
+	[ "$storage_resolved_partname" = linux_root ] || return 1
+	storage_home_resolved_name=
+	for storage_uevent in "$storage_sys_block"/sd*/uevent; do
+		[ -r "$storage_uevent" ] || continue
+		[ "$(storage_uevent_value PARTNAME "$storage_uevent" 2>/dev/null || true)" = linux_home ] || continue
+		storage_home_candidate=${storage_uevent%/uevent}
+		storage_home_candidate=${storage_home_candidate##*/}
+		case $storage_home_candidate in
+		sda[0-9]*) ;;
+		*) return 1 ;;
+		esac
+		[ -z "$storage_home_resolved_name" ] || return 1
+		storage_home_resolved_name=$storage_home_candidate
+	done
+	[ -n "$storage_home_resolved_name" ] || return 1
+	storage_home_path=$storage_dev_root/$storage_home_resolved_name
+	[ "$storage_home_path" != "$storage_target" ] || return 1
+	[ "$storage_home_path" != "$storage_parent" ] || return 1
+	storage_path_is_block "$storage_home_path" || return 1
+	[ "$("$BB" readlink -f "$storage_home_path" 2>/dev/null || true)" = "$storage_home_path" ] || return 1
+	storage_home_label_path=$("$BB" findfs LABEL=LIUQIN_HOME 2>/dev/null || true)
+	[ -n "$storage_home_label_path" ] || return 1
+	[ "$("$BB" readlink -f "$storage_home_label_path" 2>/dev/null || true)" = "$storage_home_path" ] || return 1
+	! storage_source_is_mounted "$storage_home_path" || return 1
+	storage_home_name=$storage_home_resolved_name
+	storage_home=$storage_home_path
 	return 0
 }
 
@@ -187,11 +284,29 @@ storage_identity_ok() {
 	case $storage_target_size in ''|*[!0-9]*) return 1 ;; esac
 	[ "$storage_target_size" -ge 33554432 ] || return 1
 
+	# The filesystem label is still the authority on "this is our root".
+	# PARTNAME only says which partition to look at; say which of the two
+	# routes named it, because a split-layout install that silently fell
+	# back to userdata is a misinstall, not a working boot.
 	storage_label_path=$("$BB" findfs LABEL=LIUQIN_ROOT 2>/dev/null || true)
 	[ -n "$storage_label_path" ] || return 1
 	[ "$("$BB" readlink -f "$storage_label_path" 2>/dev/null || true)" = "$storage_target" ] || return 1
+	if [ "$storage_resolved_partname" = linux_root ]; then
+		log "persistent root resolved via PARTNAME=linux_root ($storage_target), LABEL=LIUQIN_ROOT confirmed"
+	else
+		log "persistent root resolved via PARTNAME=userdata ($storage_target), LABEL=LIUQIN_ROOT confirmed"
+	fi
 	! storage_source_is_mounted "$storage_parent" || return 1
 	! storage_source_is_mounted "$storage_target" || return 1
+	storage_home_name=
+	storage_home=
+	if [ "$storage_resolved_partname" = linux_root ]; then
+		if storage_resolve_home; then
+			log "persistent home resolved via PARTNAME=linux_home ($storage_home), LABEL=LIUQIN_HOME confirmed"
+		else
+			log "persistent home not resolved via PARTNAME=linux_home/LABEL=LIUQIN_HOME; leaving it sealed read-only, /home stays on the root filesystem"
+		fi
+	fi
 	return 0
 }
 
@@ -556,11 +671,19 @@ storage_snapshot_sd_nodes() {
 	storage_sd_nodes_snapshot=$(storage_collect_sd_nodes) || return 1
 	storage_snapshot_has_parent=false
 	storage_snapshot_has_target=false
+	storage_snapshot_has_home=false
 	for storage_block in $storage_sd_nodes_snapshot; do
 		[ "$storage_block" != sda ] || storage_snapshot_has_parent=true
 		[ "$storage_block" != "$storage_target_name" ] || storage_snapshot_has_target=true
+		[ -z "$storage_home_name" ] || [ "$storage_block" != "$storage_home_name" ] ||
+			storage_snapshot_has_home=true
 	done
 	[ "$storage_snapshot_has_parent" = true ] && [ "$storage_snapshot_has_target" = true ] || return 1
+	if [ -n "$storage_home_name" ] && [ "$storage_snapshot_has_home" != true ]; then
+		log "persistent home left the UFS node set after resolution; it stays read-only"
+		storage_home_name=
+		storage_home=
+	fi
 	storage_sd_nodes_snapshot_taken=true
 }
 
@@ -624,8 +747,19 @@ storage_snapshot_persistent_ok() {
 	[ "$("$BB" readlink -f "$storage_check_target" 2>/dev/null || true)" = "$storage_check_target" ] || return 1
 	[ "$("$BB" blockdev --getro "$storage_check_parent" 2>/dev/null || true)" = 0 ] || return 1
 	[ "$("$BB" blockdev --getro "$storage_check_target" 2>/dev/null || true)" = 0 ] || return 1
+	# The home partition, when one was resolved, is the third and last node
+	# this boot is allowed to leave writable.
+	if [ -n "$storage_home_name" ]; then
+		storage_check_home=$storage_nodes_root/$storage_home_name
+		storage_path_is_block "$storage_check_home" || return 1
+		[ "$("$BB" readlink -f "$storage_check_home" 2>/dev/null || true)" = "$storage_check_home" ] || return 1
+		[ "$("$BB" blockdev --getro "$storage_check_home" 2>/dev/null || true)" = 0 ] || return 1
+	fi
 	for storage_block in $storage_sd_nodes_snapshot; do
 		case $storage_block in sda|"$storage_target_name") continue ;; esac
+		if [ -n "$storage_home_name" ] && [ "$storage_block" = "$storage_home_name" ]; then
+			continue
+		fi
 		[ "$("$BB" blockdev --getro "$storage_nodes_root/$storage_block" 2>/dev/null || true)" = 1 ] || return 1
 	done
 	return 0
@@ -648,6 +782,11 @@ storage_abort() {
 		fi
 	fi
 	storage_lock_ok=true
+	# storage_lock_all seals every /dev/sd* node, so the home partition is
+	# re-sealed with the rest; forget it as well, so no later check can treat
+	# a rejected boot's home partition as one that may stay writable.
+	storage_home_name=
+	storage_home=
 	storage_lock_all || storage_lock_ok=false
 	storage_snapshot_all_ro || storage_lock_ok=false
 	if [ "$storage_unmount_ok" = true ] && [ "$storage_lock_ok" = true ]; then
@@ -706,11 +845,27 @@ storage_prepare_persistent_root() {
 		storage_abort
 		return 1
 	}
+	# The home partition is opened at exactly the same point, for the same
+	# reason: the flag is kernel state that outlives this initramfs.  A
+	# refused BLKROSET here is not fatal -- it leaves the partition in the
+	# sealed baseline -- so drop it from the writable set and continue.
+	if [ -n "$storage_home" ]; then
+		if "$BB" blockdev --setrw "$storage_home"; then
+			log "persistent home opened read-write for the real root's fstab: $storage_home"
+		else
+			log "persistent home could not be opened; it stays read-only: $storage_home"
+			storage_home_name=
+			storage_home=
+		fi
+	fi
 	for storage_block in "$storage_dev_root"/sd*; do
 		storage_path_is_block "$storage_block" || continue
 		case $storage_block in
 			"$storage_parent"|"$storage_target") continue ;;
 		esac
+		if [ -n "$storage_home" ] && [ "$storage_block" = "$storage_home" ]; then
+			continue
+		fi
 		"$BB" blockdev --setro "$storage_block" 2>/dev/null || {
 			log "persistent root sibling could not be kept read-only: $storage_block"
 			storage_abort
@@ -763,6 +918,18 @@ storage_prepare_persistent_root() {
 	return 0
 }
 
+# LIUQIN_HOME (the optional linux_home partition) is deliberately NOT mounted
+# here.  The initramfs mounts exactly what it must verify before switch_root --
+# the root filesystem -- and everything it mounts it also has to move across
+# the switch and unwind on every failure path.  /home has no admission contract,
+# no marker and nothing in stage 1 needs it, so adding it would buy a second
+# ordering and rollback problem for nothing.  systemd in the real root mounts it
+# from /etc/fstab (the installer writes the LABEL=LIUQIN_HOME entry); if that
+# partition is missing or unlabelled the boot still reaches a shell with an empty
+# /home instead of failing in the initramfs.  What the initramfs does owe it is
+# the BLKROSET flag: storage_prepare_persistent_root clears it alongside the
+# root's, because systemd cannot mount a write-protected block device
+# read-write however correct the fstab entry is.
 storage_switch_persistent_root() {
 	if ! storage_snapshot_persistent_ok "$storage_dev_root"; then
 		log "persistent root UFS state changed before switch_root"
@@ -973,25 +1140,47 @@ if [ -z "$udc_name" ]; then
 	done
 fi
 
+# boot_a/boot_b/persist are the partitions the installer host side needs before
+# it will do anything, so a missing one is still fatal.  The data partitions are
+# not: a Linux-only install (--android-size 0) deletes userdata, and
+# linux_root/linux_home exist only after a layout has been written.  Refusing on
+# those would leave exactly the install that needs --restore-partition-table
+# without the telnet channel to run it from.  An optional partition that does
+# exist is held to the same standard as a required one -- resolvable to a single
+# block node and still read-only -- because a writable node here means the
+# fail-closed baseline did not take.
+storage_installer_required='boot_a boot_b persist'
+storage_installer_optional='userdata linux_root linux_home'
+
 start_stage1_telnet() {
 	if [ "$ufs_safe" = true ]; then
-		if [ -f /etc/liuqin-installer ]; then
-			mkdir -p /dev/disk/by-partlabel || return 1
-			for label in boot_a boot_b persist userdata; do
+		if [ -f "$storage_installer_marker" ]; then
+			mkdir -p "$storage_dev_root/disk/by-partlabel" || return 1
+			storage_installer_linked=
+			for label in $storage_installer_required $storage_installer_optional; do
 				target=
-				for info in /sys/class/block/sd*/uevent; do
+				for info in "$storage_sys_block"/sd*/uevent; do
 					if "$BB" grep -qx "PARTNAME=$label" "$info"; then
 						[ -z "$target" ] || { log "duplicate installer partition: $label"; return 1; }
 						node=${info%/uevent}; node=${node##*/}
-						target=/dev/$node
+						target=$storage_dev_root/$node
 					fi
 				done
-				[ -n "$target" ] && [ -b "$target" ] &&
+				if [ -z "$target" ]; then
+					case " $storage_installer_optional " in
+					*" $label "*) continue ;;
+					esac
+				fi
+				[ -n "$target" ] && storage_path_is_block "$target" &&
 					[ "$("$BB" blockdev --getro "$target")" = 1 ] || {
 						log "installer partition missing or writable: $label"; return 1;
 					}
-				ln -s "$target" "/dev/disk/by-partlabel/$label" || return 1
+				ln -s "$target" "$storage_dev_root/disk/by-partlabel/$label" || return 1
+				case " $storage_installer_optional " in
+				*" $label "*) storage_installer_linked="$storage_installer_linked $label" ;;
+				esac
 			done
+			log "installer data partitions linked:${storage_installer_linked:- none}"
 		fi
 		log "development-only unauthenticated shell: telnet 192.168.7.2 2323"
 		telnetd -b 192.168.7.2:2323 -l /bin/sh
@@ -1045,28 +1234,26 @@ fi
 if [ "$storage_mode" = persistent ] && [ "$ufs_safe" = true ]; then
 	if storage_prepare_persistent_root; then
 		slot_success_ok=true
-		case " $(cat /proc/cmdline) " in
-		*' androidboot.slot_suffix=_a '*)
-			if /bin/liuqin-mark-slot-successful --check-a; then
-				log "persistent root release: slot A was already successful"
-			elif /bin/liuqin-mark-slot-successful --mark-a &&
-				/bin/liuqin-mark-slot-successful --check-a; then
-				log "persistent root release: slot A marked successful"
+		# Mark the slot this boot actually came from.  Ubuntu lives in slot
+		# B once the dual-boot layout is in place and in slot A before it,
+		# so the suffix -- not a constant -- decides.  A cmdline without a
+		# usable suffix means the ABL A/B state cannot be reasoned about,
+		# and a persistent handoff that never marks the slot successful
+		# would be rolled back by the retry counter: refuse instead.
+		if slot_from_cmdline "$(cat /proc/cmdline)"; then
+			if /bin/liuqin-mark-slot-successful --check "$slot_suffix"; then
+				log "persistent root release: slot $slot_suffix was already successful"
+			elif /bin/liuqin-mark-slot-successful --mark "$slot_suffix" &&
+				/bin/liuqin-mark-slot-successful --check "$slot_suffix"; then
+				log "persistent root release: slot $slot_suffix marked successful"
 			else
-				log "critical: persistent root is valid but slot A success check/update failed"
+				log "critical: persistent root is valid but slot $slot_suffix success check/update failed"
 				slot_success_ok=false
 			fi
-			;;
-		*' androidboot.slot_suffix=_b '*)
-			log "critical: refusing a persistent root handoff while slot B is active"
+		else
+			log "critical: refusing a persistent root handoff without a usable androidboot.slot_suffix"
 			slot_success_ok=false
-			;;
-		*)
-			# QEMU/non-ABL integration tests have no Android slot suffix. They
-			# still exercise the storage contract but cannot update Qualcomm GPT attrs.
-			log "persistent root release: no Android slot suffix; slot-success update skipped"
-			;;
-		esac
+		fi
 		if [ "$slot_success_ok" != true ]; then
 			storage_abort || ufs_safe=false
 			[ "$ufs_safe" != true ] || [ ! -e /sys/class/net/usb0 ] || start_stage1_telnet

@@ -17,9 +17,15 @@ make_fake_commands() {
 	mkdir -p "$test_root/bin"
 	cat >"$test_root/bin/findfs" <<'EOF'
 #!/bin/sh
-[ "$1" = LABEL=LIUQIN_ROOT ] || exit 2
-[ "${TEST_FINDFS_FAIL:-0}" != 1 ] || exit 1
-printf '%s\n' "$TEST_LABEL_PATH"
+case $1 in
+LABEL=LIUQIN_ROOT)
+	[ "${TEST_FINDFS_FAIL:-0}" != 1 ] || exit 1
+	printf '%s\n' "$TEST_LABEL_PATH" ;;
+LABEL=LIUQIN_HOME)
+	[ -n "${TEST_HOME_LABEL_PATH:-}" ] || exit 1
+	printf '%s\n' "$TEST_HOME_LABEL_PATH" ;;
+*) exit 2 ;;
+esac
 EOF
 	cat >"$test_root/bin/blockdev" <<'EOF'
 #!/bin/sh
@@ -227,7 +233,13 @@ reset_fixture() {
 	rcs_stat=$case_root/rcs-stat
 	printf '755 0 0\n' >"$rcs_stat"
 	mutated=$case_root/mutated
+	init_log=$case_root/init-log
+	: >"$init_log"
 	: >"$command_log"
+	# The nodes every abort path must have put back into the sealed baseline.
+	# A split-layout fixture adds its linux_home node to this list.
+	ro_nodes='sda sda1 sda35 sdb'
+	TEST_HOME_LABEL_PATH=
 	TEST_LABEL_PATH=$dev/sda35
 	TEST_MARKER_STAT='644 0 0 26'
 	TEST_FINDFS_FAIL=0 TEST_FAIL_SETRW=none TEST_FAIL_SETRO=none \
@@ -246,6 +258,7 @@ reset_fixture() {
 	TEST_MUTATE_NATIVE_ON_CHROOT=0 TEST_MUTATE_NATIVE=none
 	LIUQIN_STORAGE_PROFILE_FILE= LIUQIN_STORAGE_GNOME_CONTRACT= LIUQIN_STORAGE_NATIVE_CONTRACT=
 	export case_root dev sys probe newroot state command_log mount_count umount_count
+	export init_log ro_nodes TEST_HOME_LABEL_PATH
 	export chroot_count
 	export root_contract rcs_stat mutated
 	export TEST_LABEL_PATH TEST_MARKER_STAT TEST_FINDFS_FAIL TEST_FAIL_SETRW
@@ -269,6 +282,8 @@ run_init() {
 		LIUQIN_INIT_STORAGE_TEST_PHASE="$TEST_STORAGE_PHASE" \
 		LIUQIN_INIT_TEST_PATH="$test_root/bin:/usr/bin:/bin" \
 		LIUQIN_INIT_TEST_BUSYBOX="$test_root/bin/busybox" \
+		LIUQIN_INIT_TEST_LOG="$init_log" \
+		TEST_HOME_LABEL_PATH="${TEST_HOME_LABEL_PATH:-}" \
 		LIUQIN_STORAGE_DEV_ROOT="$dev" \
 		LIUQIN_STORAGE_SYS_BLOCK="$sys" \
 		LIUQIN_STORAGE_MOUNTS="$case_root/mounts" \
@@ -305,7 +320,7 @@ run_init() {
 }
 
 assert_all_ro() {
-	for node in sda sda1 sda35 sdb; do
+	for node in ${ro_nodes:-sda sda1 sda35 sdb}; do
 		[ "$(cat "$state/$node")" = 1 ] || fail "$1 left $node writable"
 	done
 }
@@ -978,6 +993,125 @@ mv "$dev/sda35" "$dev/real-userdata"
 ln -s real-userdata "$dev/sda35"
 TEST_LABEL_PATH=$dev/sda35; export TEST_LABEL_PATH
 expect_rejected_before_open target-symlink
+# --- Split dual-boot layout: the linux_home partition ----------------------
+# P1b gave /home its own linux_home partition and left mounting it to the real
+# root's fstab (LABEL=LIUQIN_HOME, nofail).  The initramfs still sealed every
+# UFS node with BLKROSET, and that kernel-level flag survives switch_root, so
+# the first device boot after the dual install logged
+#   mount: /home: WARNING: source write-protected, mounted read-only
+# and gnome-initial-setup could not create the user's home directory.  The
+# fixture below is the split layout: sda35 is linux_root, sda36 is linux_home.
+split_reset_fixture() {
+	reset_fixture
+	printf 'PARTNAME=linux_root\n' >"$sys/sda35/uevent"
+	mkdir -p "$sys/sda36"
+	printf '36\n' >"$sys/sda36/partition"
+	printf '201326592\n' >"$sys/sda36/size"
+	printf 'PARTNAME=linux_home\n' >"$sys/sda36/uevent"
+	: >"$dev/sda36"
+	: >"$newroot/dev/sda36"
+	printf '1\n' >"$state/sda36"
+	ro_nodes='sda sda1 sda35 sda36 sdb'
+	TEST_HOME_LABEL_PATH=$dev/sda36
+	export ro_nodes TEST_HOME_LABEL_PATH
+}
+
+split_assert_home_opened() {
+	name=$1
+	[ "$(cat "$state/sda36")" = 0 ] ||
+		fail "$name: linux_home is still write-protected at the handoff"
+	grep -q -- "^--setrw $dev/sda36\$" "$command_log" ||
+		fail "$name: BLKROSET was never cleared on linux_home"
+	grep -q "persistent home resolved via PARTNAME=linux_home ($dev/sda36), LABEL=LIUQIN_HOME confirmed" \
+		"$init_log" || fail "$name: home resolution was not logged"
+	grep -q 'persistent home opened read-write' "$init_log" ||
+		fail "$name: opening linux_home was not logged"
+}
+
+# "Unresolved" is a boot that continues: no BLKROSET clear, no abort, and a log
+# line saying why /home stays where it is.
+split_assert_home_unresolved() {
+	name=$1
+	! grep -q -- "^--setrw $dev/sda36\$" "$command_log" ||
+		fail "$name: BLKROSET was cleared on an unusable linux_home"
+	grep -q 'persistent home not resolved' "$init_log" ||
+		fail "$name: the unresolved home partition was not logged"
+}
+
+split_assert_home_sealed() {
+	split_assert_home_unresolved "$1"
+	[ "$(cat "$state/sda36")" = 1 ] ||
+		fail "$1: an unusable linux_home was opened read-write"
+}
+
+# The fix itself: linux_home found on the same LUN, LABEL=LIUQIN_HOME agrees,
+# and its read-only flag is cleared so systemd can mount /home read-write.
+split_reset_fixture; expect_success split-home-valid; split_assert_home_opened split-home-valid
+
+# The label is the authority on "this is our /home", exactly as for the root.
+split_reset_fixture; TEST_HOME_LABEL_PATH=$dev/sda1; export TEST_HOME_LABEL_PATH
+expect_success split-home-label-disagrees; split_assert_home_sealed split-home-label-disagrees
+split_reset_fixture; TEST_HOME_LABEL_PATH=; export TEST_HOME_LABEL_PATH
+expect_success split-home-label-missing; split_assert_home_sealed split-home-label-missing
+
+# Ambiguity fails closed on the partition, never on the boot.
+split_reset_fixture
+mkdir -p "$sys/sda37"; printf 'PARTNAME=linux_home\n' >"$sys/sda37/uevent"
+: >"$dev/sda37"; : >"$newroot/dev/sda37"; printf '1\n' >"$state/sda37"
+ro_nodes='sda sda1 sda35 sda36 sda37 sdb'; export ro_nodes
+expect_success split-home-duplicate; split_assert_home_sealed split-home-duplicate
+[ "$(cat "$state/sda37")" = 1 ] || fail "split-home-duplicate: second linux_home became writable"
+
+split_reset_fixture
+rm -rf "$sys/sda36"; mkdir -p "$sys/sdb1"; printf 'PARTNAME=linux_home\n' >"$sys/sdb1/uevent"
+expect_success split-home-wrong-lun; split_assert_home_sealed split-home-wrong-lun
+
+# No linux_home at all (an install that never split /home out) is a normal
+# boot: the fstab entry is nofail and /home stays on the root filesystem.
+split_reset_fixture
+rm -rf "$sys/sda36" "$dev/sda36" "$newroot/dev/sda36" "$state/sda36"
+ro_nodes='sda sda1 sda35 sdb'; TEST_HOME_LABEL_PATH=; export ro_nodes TEST_HOME_LABEL_PATH
+expect_success split-home-absent; split_assert_home_unresolved split-home-absent
+
+# A refused BLKROSET leaves the partition in the sealed baseline and the boot
+# continues; it must not be left in the writable set afterwards.
+split_reset_fixture; TEST_FAIL_SETRW=sda36; export TEST_FAIL_SETRW
+expect_success split-home-setrw-refused
+[ "$(cat "$state/sda36")" = 1 ] || fail "split-home-setrw-refused: linux_home is not sealed"
+grep -q 'persistent home could not be opened' "$init_log" ||
+	fail "split-home-setrw-refused: the refused open was not logged"
+
+# Every abort after the pair was opened re-seals the home partition with the
+# rest of the LUN.  The setrw assertion proves the re-seal is doing work.
+split_reset_fixture; TEST_FAIL_MOUNT_NUMBER=2; export TEST_FAIL_MOUNT_NUMBER
+expect_rejected split-home-abort-reseals
+grep -q -- "^--setrw $dev/sda36\$" "$command_log" ||
+	fail "split-home-abort-reseals: linux_home was never opened, so the re-seal proves nothing"
+split_reset_fixture; TEST_MUTATE_RCS_ON_CHROOT=2 TEST_MUTATE_RCS=stale
+export TEST_MUTATE_RCS_ON_CHROOT TEST_MUTATE_RCS
+expect_rejected split-home-rw-reject-reseals
+
+# The handoff re-checks the same UFS state under the moved /dev, so linux_home
+# has to remain in the writable set there too -- otherwise the last snapshot
+# before switch_root would reject exactly the boot this change enables.
+split_reset_fixture; TEST_STORAGE_PHASE=switch; export TEST_STORAGE_PHASE
+expect_switch_root_returned_fail_closed split-home-switch-root
+split_assert_home_opened split-home-switch-root
+
+# The legacy layout (root on userdata) is untouched: no resolution, no clear,
+# not even a log line, whatever else the GPT happens to contain.
+reset_fixture
+mkdir -p "$sys/sda36"; printf 'PARTNAME=linux_home\n' >"$sys/sda36/uevent"
+: >"$dev/sda36"; : >"$newroot/dev/sda36"; printf '1\n' >"$state/sda36"
+ro_nodes='sda sda1 sda35 sda36 sdb'; TEST_HOME_LABEL_PATH=$dev/sda36
+export ro_nodes TEST_HOME_LABEL_PATH
+expect_success legacy-home-untouched
+[ "$(cat "$state/sda36")" = 1 ] ||
+	fail "legacy-home-untouched: the legacy layout opened linux_home"
+! grep -q -- "^--setrw $dev/sda36\$" "$command_log" ||
+	fail "legacy-home-untouched: the legacy layout cleared BLKROSET on linux_home"
+! grep -q 'persistent home' "$init_log" ||
+	fail "legacy-home-untouched: the legacy layout ran home resolution"
 
 # --- GNOME root profile ----------------------------------------------------
 # A valid gnome profile mounts the volume, binds gnome-root/ to newroot,
@@ -1163,11 +1297,17 @@ grep -q '^	storage_marker_sha256=bd86a359f5b6bf05f09abf544967489e924c251ab7c0768
 	"$init" || fail "gnome marker content contract changed"
 grep -q '497a8b108a3eefc839c3738a5c452ee3d6a437eb1ebaf0ea43bd635a8a227978' "$init" ||
 	fail "gnome profile-file hash pin changed"
-slot_check_lines=$(grep -n '/bin/liuqin-mark-slot-successful --check-a' "$init" | cut -d: -f1)
+# The slot marked successful is the slot this boot came from, never a constant:
+# Ubuntu sits in slot A before the dual-boot split and in slot B after it.
+slot_check_lines=$(grep -n '/bin/liuqin-mark-slot-successful --check "\$slot_suffix"' "$init" | cut -d: -f1)
 slot_check_first=$(printf '%s\n' "$slot_check_lines" | sed -n '1p')
 slot_check_second=$(printf '%s\n' "$slot_check_lines" | sed -n '2p')
-slot_mark_line=$(grep -n '/bin/liuqin-mark-slot-successful --mark-a' "$init" | cut -d: -f1)
-slot_b_refuse_line=$(grep -n 'refusing a persistent root handoff while slot B is active' "$init" | cut -d: -f1)
+slot_mark_line=$(grep -n '/bin/liuqin-mark-slot-successful --mark "\$slot_suffix"' "$init" | cut -d: -f1)
+slot_b_refuse_line=$(grep -n 'refusing a persistent root handoff without a usable androidboot.slot_suffix' "$init" | cut -d: -f1)
+! grep -q 'liuqin-mark-slot-successful --mark-a\|liuqin-mark-slot-successful --check-a' "$init" ||
+	fail "init still pins slot A in the slot-success gate"
+grep -q '^		if slot_from_cmdline "\$(cat /proc/cmdline)"; then$' "$init" ||
+	fail "slot-success gate no longer derives the slot from the cmdline"
 switch_line=$(grep -n 'elif ! storage_switch_persistent_root; then' "$init" | cut -d: -f1)
 case $slot_check_first:$slot_mark_line:$slot_check_second:$slot_b_refuse_line:$switch_line in
 	*[!0-9:]*|*::*|:*) fail "persistent slot-success gate is missing" ;;
@@ -1179,5 +1319,197 @@ esac
 	[ "$slot_check_second" -lt "$switch_line" ] &&
 	[ "$slot_b_refuse_line" -lt "$switch_line" ] ||
 	fail "persistent root can switch before the slot-success gate"
+
+# The split dual-boot layout puts the root in linux_root; a single-system
+# install still hands over userdata.  linux_root has to win when both exist.
+grep -q '^	for storage_partname in linux_root userdata; do$' "$init" ||
+	fail "root resolution no longer prefers PARTNAME=linux_root over userdata"
+grep -q '^	storage_partlabel_link=\$storage_dev_root/disk/by-partlabel/linux_root$' "$init" ||
+	fail "root resolution no longer cross-checks by-partlabel"
+grep -q 'findfs LABEL=LIUQIN_ROOT' "$init" ||
+	fail "root resolution no longer confirms LABEL=LIUQIN_ROOT"
+
+# The split layout also has to clear the read-only flag on linux_home, and it
+# has to do so in exactly one window: after the root has proven its own
+# identity (a partition named by a root we have not admitted is not authority
+# enough to unseal anything) and before the handoff (after switch_root the
+# initramfs is gone and the flag is whatever it was left as).
+home_resolve_def_line=$(grep -cn '^storage_resolve_home() {$' "$init")
+[ "$home_resolve_def_line" = 1 ] ||
+	fail "init does not define exactly one storage_resolve_home"
+grep -q '^	\[ "\$storage_resolved_partname" = linux_root \] || return 1$' "$init" ||
+	fail "home resolution is not restricted to the split linux_root layout"
+grep -q '^		sda\[0-9\]\*) ;;$' "$init" ||
+	fail "home resolution no longer pins the first UFS LUN"
+grep -q 'findfs LABEL=LIUQIN_HOME' "$init" ||
+	fail "home resolution no longer cross-checks LABEL=LIUQIN_HOME"
+root_label_line=$(grep -n 'findfs LABEL=LIUQIN_ROOT' "$init" | cut -d: -f1)
+home_call_line=$(grep -n '^		if storage_resolve_home; then$' "$init" | cut -d: -f1)
+identity_gate_line=$(grep -n '^	storage_identity_ok || {$' "$init" | cut -d: -f1)
+root_setrw_line=$(grep -n 'blockdev --setrw "\$storage_target"' "$init" | cut -d: -f1)
+home_setrw_line=$(grep -n 'blockdev --setrw "\$storage_home"' "$init" | cut -d: -f1)
+switch_exec_line=$(grep -n '^	exec "\$BB" switch_root ' "$init" | cut -d: -f1)
+case $root_label_line:$home_call_line:$identity_gate_line:$root_setrw_line:$home_setrw_line:$switch_exec_line in
+	*[!0-9:]*|*::*|:*|*:) fail "the linux_home read-only clear is not where it must be" ;;
+esac
+[ "$root_label_line" -lt "$home_call_line" ] ||
+	fail "home resolution runs before the root confirms LABEL=LIUQIN_ROOT"
+[ "$home_call_line" -lt "$identity_gate_line" ] ||
+	fail "home resolution is not part of the root identity check"
+[ "$identity_gate_line" -lt "$root_setrw_line" ] ||
+	fail "the root identity gate no longer precedes the BLKROSET clears"
+[ "$root_setrw_line" -lt "$home_setrw_line" ] ||
+	fail "linux_home is unsealed before the root partition is"
+[ "$home_setrw_line" -lt "$switch_exec_line" ] ||
+	fail "linux_home is unsealed after switch_root, where it can no longer help"
+
+# Whatever rejects the boot must put linux_home back with the rest of the LUN.
+sed -n '/^storage_abort() {$/,/^}$/p' "$init" >"$test_root/abort-body"
+[ -s "$test_root/abort-body" ] || fail "could not extract storage_abort from init"
+grep -q '^	storage_home_name=$' "$test_root/abort-body" ||
+	fail "storage_abort no longer drops linux_home from the writable set"
+grep -q '^	storage_lock_all || storage_lock_ok=false$' "$test_root/abort-body" ||
+	fail "storage_abort no longer re-seals every UFS node"
+
+# --------------------------------------------------------------------------
+# Installer-mode /dev/disk/by-partlabel: boot_a/boot_b/persist are required,
+# userdata/linux_root/linux_home are optional.  A Linux-only install deletes
+# userdata and a fresh device has no linux_root, and either case must still get
+# a telnet channel -- that is the channel --restore-partition-table runs from.
+# --------------------------------------------------------------------------
+installer_root=$test_root/installer
+sed -n '/^storage_path_is_block() {$/,/^}$/p' "$init" >"$installer_root.fn1"
+sed -n '/^storage_installer_required=/,/^}$/p' "$init" >"$installer_root.fn2"
+[ -s "$installer_root.fn1" ] && [ -s "$installer_root.fn2" ] ||
+	fail "could not extract the installer by-partlabel helpers from init"
+grep -q '^storage_installer_required=.boot_a boot_b persist.$' "$init" ||
+	fail "installer required partition set changed"
+grep -q '^storage_installer_optional=.userdata linux_root linux_home.$' "$init" ||
+	fail "installer optional partition set changed"
+
+# $1 case name, $2 writable node suffix or empty, rest: PARTNAME values
+installer_run() {
+	installer_name=$1; installer_writable=$2; shift 2
+	installer_case=$installer_root/$installer_name
+	rm -rf "$installer_case"
+	mkdir -p "$installer_case/dev" "$installer_case/sys" "$installer_case/etc"
+	: >"$installer_case/etc/liuqin-installer"
+	installer_index=10
+	for installer_label in "$@"; do
+		installer_index=$((installer_index + 1))
+		mkdir -p "$installer_case/sys/sda$installer_index"
+		printf 'PARTNAME=%s\n' "$installer_label" \
+			>"$installer_case/sys/sda$installer_index/uevent"
+		: >"$installer_case/dev/sda$installer_index"
+		[ "$installer_label" != "$installer_writable" ] ||
+			printf '%s\n' "sda$installer_index" >"$installer_case/writable"
+	done
+	cat >"$installer_case/bb" <<'INSTALLER_BB'
+#!/bin/sh
+installer_bb_cmd=$1; shift
+case $installer_bb_cmd in
+grep) exec grep "$@" ;;
+blockdev)
+	installer_bb_node=${2##*/}
+	if [ -r "$INSTALLER_WRITABLE_FILE" ] &&
+		[ "$(cat "$INSTALLER_WRITABLE_FILE")" = "$installer_bb_node" ]; then
+		printf '0\n'
+	else
+		printf '1\n'
+	fi
+	;;
+*) exit 2 ;;
+esac
+INSTALLER_BB
+	chmod 0755 "$installer_case/bb"
+	{
+		printf 'BB=%s\n' "$installer_case/bb"
+		printf 'ufs_safe=true\n'
+		printf 'storage_dev_root=%s\n' "$installer_case/dev"
+		printf 'storage_sys_block=%s\n' "$installer_case/sys"
+		printf 'storage_installer_marker=%s\n' "$installer_case/etc/liuqin-installer"
+		printf 'log() { printf "log: %%s\\n" "$*"; }\n'
+		printf 'telnetd() { printf "telnetd\\n"; }\n'
+		cat "$installer_root.fn1"
+		cat "$installer_root.fn2"
+		printf 'start_stage1_telnet\n'
+	} >"$installer_case/run.sh"
+	LIUQIN_INIT_STORAGE_TEST_ONLY=1 \
+		INSTALLER_WRITABLE_FILE="$installer_case/writable" \
+		"$host_busybox" sh "$installer_case/run.sh" >"$installer_case/out" 2>&1
+}
+
+installer_expect_ok() {
+	installer_expect_name=$1; shift
+	installer_run "$installer_expect_name" '' "$@" ||
+		fail "installer/$installer_expect_name: refused a usable layout"
+	grep -q '^telnetd$' "$installer_root/$installer_expect_name/out" ||
+		fail "installer/$installer_expect_name: telnet channel was not opened"
+}
+
+installer_expect_refused() {
+	installer_expect_name=$1; installer_expect_writable=$2; shift 2
+	if installer_run "$installer_expect_name" "$installer_expect_writable" "$@"; then
+		fail "installer/$installer_expect_name: accepted a layout it must refuse"
+	fi
+	! grep -q '^telnetd$' "$installer_root/$installer_expect_name/out" ||
+		fail "installer/$installer_expect_name: opened telnet after a refusal"
+}
+
+installer_linked() {
+	[ -L "$installer_root/$1/dev/disk/by-partlabel/$2" ]
+}
+
+# Every optional partition present: all six get a symlink.
+installer_expect_ok full boot_a boot_b persist userdata linux_root linux_home
+for installer_label in boot_a boot_b persist userdata linux_root linux_home; do
+	installer_linked full "$installer_label" ||
+		fail "installer/full: $installer_label was not linked"
+done
+grep -q '^log: installer data partitions linked: userdata linux_root linux_home$' \
+	"$installer_root/full/out" || fail "installer/full: optional link log is wrong"
+
+# Bare device, nothing but the required three: still a telnet channel.
+installer_expect_ok bare boot_a boot_b persist
+for installer_label in boot_a boot_b persist; do
+	installer_linked bare "$installer_label" ||
+		fail "installer/bare: $installer_label was not linked"
+done
+for installer_label in userdata linux_root linux_home; do
+	! installer_linked bare "$installer_label" ||
+		fail "installer/bare: $installer_label was linked but does not exist"
+done
+grep -q '^log: installer data partitions linked: none$' "$installer_root/bare/out" ||
+	fail "installer/bare: optional link log is wrong"
+
+# A Linux-only install (--android-size 0) has no userdata at all.
+installer_expect_ok linux-only boot_a boot_b persist linux_root linux_home
+! installer_linked linux-only userdata ||
+	fail "installer/linux-only: userdata was linked but does not exist"
+installer_linked linux-only linux_root ||
+	fail "installer/linux-only: linux_root was not linked"
+grep -q '^log: installer data partitions linked: linux_root linux_home$' \
+	"$installer_root/linux-only/out" || fail "installer/linux-only: optional link log is wrong"
+
+# The linux_root symlink has to agree with the uevent resolution, because
+# storage_resolve_target cross-checks exactly that node.
+installer_linked linux-only linux_root &&
+	[ "$(readlink "$installer_root/linux-only/dev/disk/by-partlabel/linux_root")" \
+		= "$installer_root/linux-only/dev/sda14" ] ||
+	fail "installer/linux-only: linux_root points at the wrong node"
+
+# Each required partition is fatal when missing; no optional one ever is.
+installer_expect_refused no-boot-a '' boot_b persist userdata
+installer_expect_refused no-boot-b '' boot_a persist userdata
+installer_expect_refused no-persist '' boot_a boot_b userdata
+installer_expect_ok no-userdata boot_a boot_b persist linux_root
+installer_expect_ok no-linux-root boot_a boot_b persist userdata
+installer_expect_ok no-linux-home boot_a boot_b persist userdata linux_root
+
+# Duplicates and writable nodes are refused whether the label is required or not.
+installer_expect_refused dup-required '' boot_a boot_a boot_b persist
+installer_expect_refused dup-optional '' boot_a boot_b persist linux_root linux_root
+installer_expect_refused rw-required persist boot_a boot_b persist
+installer_expect_refused rw-optional linux_root boot_a boot_b persist linux_root
 
 printf '%s\n' 'liuqin persistent-root fail-closed tests: PASS'
