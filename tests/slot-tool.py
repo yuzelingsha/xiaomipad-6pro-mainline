@@ -172,12 +172,6 @@ def sectors_zero(path, first, last):
         return image.read((last - first + 1) * SECTOR) == bytes((last - first + 1) * SECTOR)
 
 
-def write_magic(path, magic=b"ANDROID!"):
-    with open(path, "r+b") as image:
-        image.seek(BOOT_A[0] * SECTOR)
-        image.write(magic)
-
-
 def run_tool(binary, image, *args):
     env = dict(os.environ, LIUQIN_SLOT_SUCCESS_TESTING="unsafe-mock-only")
     return subprocess.run([binary, "--test-image", str(image), *args],
@@ -249,17 +243,20 @@ def test_mark_tool(binary, tmp):
     # usage
     make_image(image)
     for args, why in (([], "no operation"), (["--mark"], "--mark without a slot"),
-                      (["--mark", "c"], "--mark c"), (["--set-active"], "--set-active alone"),
-                      (["--check", "_c"], "--check _c")):
+                      (["--mark", "c"], "--mark c"), (["--check", "_c"], "--check _c")):
         run = run_tool(binary, image, *args)
         check(f"usage: {why} exits 2", run.returncode == 2, f"rc={run.returncode}")
 
-    # --set-active demands the acknowledgement
-    run = run_tool(binary, image, "--set-active", "b")
-    check("--set-active without --i-know is refused",
-          run.returncode == 1 and "--i-know" in run.stderr, f"rc={run.returncode}")
-    check("refused --set-active left the GPT alone",
-          attrs(image, 1, 13) == 0x0077 and attrs(image, 1, 42) == 0x007A)
+    # Slot selection was retired: on this ABL it needs the type-GUID swap and
+    # the UFS boot LUN that only `fastboot --set-active` performs.  The old
+    # spellings must be plain usage errors that leave the GPT alone.
+    snapshot = gpt_regions(image)
+    for args in (["--set-active", "a"], ["--set-active", "b", "--i-know"],
+                 ["--mark", "a", "--i-know"]):
+        run = run_tool(binary, image, *args)
+        check(f"retired: {' '.join(args)} exits 2", run.returncode == 2,
+              f"rc={run.returncode}")
+    check("the retired spellings left the GPT alone", gpt_regions(image) == snapshot)
 
     # --check / --mark on the active slot
     make_image(image, attr_a=0x0077, attr_b=0x007A)
@@ -286,56 +283,29 @@ def test_mark_tool(binary, tmp):
     run = run_tool(binary, image, "--check", "a")
     check("--check a after marking passes", run.returncode == 0)
 
-    # --set-active a without the ANDROID! magic
-    make_image(image)
+    # the same cycle on slot B, as `fastboot --set-active=b` leaves it
+    # (0x3F on boot_b, 0x3A on boot_a)
+    make_image(image, attr_a=0x003A, attr_b=0x003F)
     before = other_entries(image, 1)
-    run = run_tool(binary, image, "--set-active", "a", "--i-know")
-    check("--set-active a without ANDROID! is refused",
-          run.returncode == 1 and "ANDROID!" in run.stderr, f"{run.stderr!r}")
-    check("the refused --set-active a changed nothing",
-          attrs(image, 1, 13) == 0x0077 and attrs(image, 1, 42) == 0x007A and
-          other_entries(image, 1) == before)
-
-    write_magic(image, b"ANDROIDX")
-    run = run_tool(binary, image, "--set-active", "a", "--i-know")
-    check("--set-active a with a near-miss magic is refused", run.returncode == 1)
-
-    # --set-active a with the magic
-    write_magic(image)
-    run = run_tool(binary, image, "--set-active", "a", "--i-know")
-    check("--set-active a with ANDROID! succeeds", run.returncode == 0, f"{run.stderr!r}")
-    check("slot A became 0x3F (priority 3, active, 7 retries)",
-          attrs(image, 1, 13) == 0x003F, f"{attrs(image, 1, 13):#06x}")
-    check("slot B became 0x3A (priority 2, inactive, 7 retries)",
-          attrs(image, 1, 42) == 0x003A, f"{attrs(image, 1, 42):#06x}")
-    check("--set-active mirrored into the backup GPT",
-          attrs(image, DISK_LBAS - 1, 13) == 0x003F and
-          attrs(image, DISK_LBAS - 1, 42) == 0x003A)
-    check("--set-active left both CRCs valid",
-          crcs_valid(image, 1) and crcs_valid(image, DISK_LBAS - 1))
-    check("--set-active left every other entry byte-identical",
-          other_entries(image, 1) == before and other_entries(image, DISK_LBAS - 1) == before)
-
-    # --set-active b needs no magic, and the marked-successful cycle follows
-    make_image(image)
-    run = run_tool(binary, image, "--set-active", "b", "--i-know")
-    check("--set-active b succeeds without any magic", run.returncode == 0, f"{run.stderr!r}")
-    check("slot B is active and slot A demoted",
-          attrs(image, 1, 42) == 0x003F and attrs(image, 1, 13) == 0x003A)
+    run = run_tool(binary, image, "--check", "b")
+    check("--check b before marking is refused", run.returncode == 1)
     run = run_tool(binary, image, "--mark", "b")
-    check("--mark b after --set-active b succeeds", run.returncode == 0, f"{run.stderr!r}")
+    check("--mark b succeeds", run.returncode == 0, f"{run.stderr!r}")
     check("slot B is now successful", attrs(image, 1, 42) == 0x007F,
           f"{attrs(image, 1, 42):#06x}")
+    check("--mark b did not touch slot A", attrs(image, 1, 13) == 0x003A)
+    check("--mark b mirrored into the backup GPT and kept both CRCs valid",
+          attrs(image, DISK_LBAS - 1, 42) == 0x007F and
+          crcs_valid(image, 1) and crcs_valid(image, DISK_LBAS - 1))
+    check("--mark b left every other entry byte-identical",
+          other_entries(image, 1) == before and other_entries(image, DISK_LBAS - 1) == before)
     run = run_tool(binary, image, "--check", "b")
     check("--check b passes", run.returncode == 0)
     run = run_tool(binary, image, "--check", "a")
-    check("--check a now fails: slot A is no longer active", run.returncode == 1)
-
-    # both slots active at once is not a table this tool understands
-    make_image(image, attr_a=0x0077, attr_b=0x007E)
-    write_magic(image)
-    run = run_tool(binary, image, "--set-active", "a", "--i-know")
-    check("--set-active refuses a table with two active slots", run.returncode == 1)
+    check("--check a fails: slot A is not active", run.returncode == 1)
+    run = run_tool(binary, image, "--mark", "a")
+    check("--mark a refuses the inactive slot A", run.returncode == 1 and
+          attrs(image, 1, 13) == 0x003A)
 
     # a corrupt primary CRC fails closed
     make_image(image)
@@ -397,23 +367,6 @@ def test_entry_locations(binary, tmp):
         run = run_tool(binary, image, "--check", "a")
         check(f"{label}: --check a after marking passes", run.returncode == 0)
 
-        make_image(image, **layout)
-        write_magic(image)
-        run = run_tool(binary, image, "--set-active", "a", "--i-know")
-        check(f"{label}: --set-active a succeeds", run.returncode == 0, f"{run.stderr!r}")
-        check(f"{label}: --set-active a wrote 0x3F/0x3A to both copies",
-              attrs(image, 1, 13) == 0x003F and attrs(image, 1, 42) == 0x003A and
-              attrs(image, backup, 13) == 0x003F and attrs(image, backup, 42) == 0x003A)
-        run = run_tool(binary, image, "--set-active", "b", "--i-know")
-        check(f"{label}: --set-active b succeeds", run.returncode == 0, f"{run.stderr!r}")
-        check(f"{label}: --set-active b wrote 0x3F/0x3A to both copies",
-              attrs(image, 1, 42) == 0x003F and attrs(image, 1, 13) == 0x003A and
-              attrs(image, backup, 42) == 0x003F and attrs(image, backup, 13) == 0x003A)
-        check(f"{label}: --set-active left both CRCs valid and the array in place",
-              crcs_valid(image, 1) and crcs_valid(image, backup) and
-              struct.unpack_from("<Q", read_copy(image, backup)[0], 72)[0] == entries_lba and
-              sectors_zero(image, entries_lba + 3, backup - 1))
-
     # Boundaries that are legal: the primary array ending exactly at
     # FirstUsableLBA, the backup array starting right after LastUsableLBA and
     # ending right before the backup header.
@@ -431,10 +384,9 @@ def test_entry_locations(binary, tmp):
               crcs_valid(image, 1) and crcs_valid(image, backup), f"{run.stderr!r}")
 
     # Locations that overlap the usable area or a header, plus geometry the
-    # two headers disagree on.  Every one must be refused for --check, --mark
-    # and --set-active, and leave every GPT sector untouched.  Slot A is
-    # already successful and boot_a carries ANDROID!, so on an accepted table
-    # every one of the four calls below would succeed.
+    # two headers disagree on.  Every one must be refused for --check and
+    # --mark, and leave every GPT sector untouched.  Slot A is already
+    # successful, so on an accepted table both calls below would succeed.
     for label, kwargs in (
             ("primary entries at LBA 4 (overlap FirstUsableLBA)",
              dict(primary_entries=4)),
@@ -454,14 +406,11 @@ def test_entry_locations(binary, tmp):
              dict(backup_entries=DISK_LBAS - 7, last_usable=DISK_LBAS - 6,
                   backup_last_usable=DISK_LBAS - 8))):
         make_image(image, **kwargs)
-        write_magic(image)
         snapshot = gpt_regions(image)
         results = [run_tool(binary, image, *args).returncode for args in
-                   (("--check", "a"), ("--mark", "a"),
-                    ("--set-active", "a", "--i-know"),
-                    ("--set-active", "b", "--i-know"))]
+                   (("--check", "a"), ("--mark", "a"))]
         check(f"rejected: {label}",
-              results == [1, 1, 1, 1] and gpt_regions(image) == snapshot,
+              results == [1, 1] and gpt_regions(image) == snapshot,
               f"rc={results}")
 
 

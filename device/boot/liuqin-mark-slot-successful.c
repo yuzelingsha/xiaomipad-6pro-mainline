@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-/* Read and edit liuqin's Qualcomm A/B slot metadata in the sde GPT, fail closed.
+/* Check and mark the running liuqin A/B slot successful in the sde GPT, fail closed.
  *
  * Qualcomm keeps the A/B state in bits 48-55 of the GPT entry attributes of
  * each slot-suffixed partition:
@@ -7,12 +7,13 @@
  *   b48-b49 priority   b50 active   b51-b53 retry count
  *   b54 successful     b55 unbootable
  *
- * Only boot_a/boot_b are touched.  ABL selects the slot from the boot_*
- * entries; the vbmeta/dtbo/vendor_boot/recovery pairs on this device still
- * carry their factory defaults (0x00FF / 0x007B), which do not follow the
- * active/inactive pattern at all, and both slots hold byte-identical images
- * there anyway (see the P0 inventory).  Rewriting them would enlarge an
- * irreversible GPT write without changing which slot boots.
+ * This tool only reads those bits and marks the slot it is running from
+ * successful (--mark/--check).  It must never select a slot.  Verified on the
+ * device on 2026-09-25: rewriting only the boot_a/boot_b attribute bytes left
+ * the tablet unable to boot.  Switching slots on this ABL means swapping the
+ * partition type GUIDs of every _a/_b pair and moving the UFS boot LUN, which
+ * only the bootloader's own `fastboot --set-active` does.  Dual boot therefore
+ * rotates boot images through slot A instead (liuqin-switch).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -37,22 +38,13 @@
 #define BOOT_A_LAST 124165ULL
 #define BOOT_B_FIRST 344107ULL
 #define BOOT_B_LAST 393258ULL
-#define ATTR_SHIFT 48
-#define ATTR_BYTE_MASK (0xFFULL << ATTR_SHIFT)
 #define ATTR_PRIORITY_MASK (3ULL << 48)
 #define ATTR_ACTIVE (1ULL << 50)
 #define ATTR_TRIES_MASK (7ULL << 51)
 #define ATTR_SUCCESSFUL (1ULL << 54)
 #define ATTR_UNBOOTABLE (1ULL << 55)
-/* Qualcomm gpt-utils writes these two bytes on `fastboot --set-active`:
- * 0x3F = priority 3, active, 7 retries; 0x3A = priority 2, inactive, 7
- * retries.  The factory state recorded in the P0 inventory (boot_a 0x77 =
- * 0x3F|successful with one retry spent, boot_b 0x7A = 0x3A|successful)
- * matches exactly. */
-#define AB_SLOT_ACTIVE_VAL 0x3FULL
-#define AB_SLOT_INACTIVE_VAL 0x3AULL
 
-enum op { OP_NONE, OP_MARK, OP_CHECK, OP_SET_ACTIVE };
+enum op { OP_NONE, OP_MARK, OP_CHECK };
 
 static uint32_t le32(const unsigned char *p)
 {
@@ -254,26 +246,15 @@ static int sde_is_unmounted(void)
 	return 1;
 }
 
-static int boot_is_android(int fd, const unsigned char *entry)
-{
-	unsigned char magic[8];
-
-	if (full_pread(fd, magic, sizeof(magic), (off_t)(le64(entry + 32) * SECTOR_SIZE)))
-		return 0;
-	return !memcmp(magic, "ANDROID!", 8);
-}
-
 static void usage(void)
 {
 	fputs("usage: liuqin-mark-slot-successful --mark <a|b>\n"
 	      "       liuqin-mark-slot-successful --check <a|b>\n"
-	      "       liuqin-mark-slot-successful --set-active <a|b> --i-know\n"
 	      "\n"
-	      "--mark        set successful and clear unbootable on the running slot\n"
-	      "--check       report whether that slot is already successful\n"
-	      "--set-active  make the slot the ABL boot target and reboot-select it;\n"
-	      "              --i-know is mandatory, and slot a additionally requires\n"
-	      "              boot_a to start with the ANDROID! boot-image magic\n",
+	      "--mark   set successful and clear unbootable on the running slot\n"
+	      "--check  report whether that slot is already successful\n"
+	      "\n"
+	      "Slot selection is the bootloader's job (fastboot --set-active).\n",
 	      stderr);
 }
 
@@ -293,24 +274,20 @@ int main(int argc, char **argv)
 	static const char slot_name[2] = { 'A', 'B' };
 	const char *path = "/dev/sde";
 	int testing = 0, made_rw = 0, fd = -1, ro = 1, zero = 0, one = 1, rc = 1;
-	int i, i_know = 0, slot = -1, other, running;
+	int i, slot = -1, other, running;
 	enum op op = OP_NONE;
-	uint64_t bytes = 0, disk_lbas, attrs, other_attrs = 0;
+	uint64_t bytes = 0, disk_lbas, attrs;
 	struct stat st;
 	struct gpt_copy primary, backup, verify_primary, verify_backup;
-	unsigned char *pt, *bt, *po, *bo, *vp, *vb;
+	unsigned char *pt, *bt, *po, *vp, *vb;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--test-image") && i + 1 < argc && !testing) {
 			testing = 1;
 			path = argv[++i];
-		} else if (!strcmp(argv[i], "--i-know") && !i_know) {
-			i_know = 1;
 		} else if (i + 1 < argc && op == OP_NONE &&
-			   (!strcmp(argv[i], "--mark") || !strcmp(argv[i], "--check") ||
-			    !strcmp(argv[i], "--set-active"))) {
-			op = !strcmp(argv[i], "--mark") ? OP_MARK :
-			     !strcmp(argv[i], "--check") ? OP_CHECK : OP_SET_ACTIVE;
+			   (!strcmp(argv[i], "--mark") || !strcmp(argv[i], "--check"))) {
+			op = !strcmp(argv[i], "--mark") ? OP_MARK : OP_CHECK;
 			if (parse_slot(argv[++i], &slot)) {
 				usage();
 				return 2;
@@ -339,17 +316,11 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		/* --mark/--check speak only about the slot we are running from. */
-		if (op != OP_SET_ACTIVE && running != slot) {
+		if (running != slot) {
 			fprintf(stderr, "liuqin-slot-success: refusing to touch slot %c "
 				"while running slot %c\n", slot_name[slot], slot_name[running]);
 			return 1;
 		}
-	}
-	/* The --i-know acknowledgement is a CLI guard, not a device guard: it
-	 * applies to the mock image path too, so tests cover it. */
-	if (op == OP_SET_ACTIVE && !i_know) {
-		fprintf(stderr, "liuqin-slot-success: --set-active requires --i-know\n");
-		return 1;
 	}
 
 	if (lstat(path, &st) || (!testing && !S_ISBLK(st.st_mode)) ||
@@ -384,44 +355,23 @@ int main(int argc, char **argv)
 	 * rebuild the backup array from it rather than merging untrusted attrs. */
 	memcpy(backup.entries, primary.entries, sizeof(primary.entries));
 	bt = find_boot(&backup, slot);
-	bo = find_boot(&backup, other);
 	attrs = le64(pt + 48);
-	other_attrs = le64(po + 48);
 
-	if (op == OP_SET_ACTIVE) {
-		/* Exactly one slot may claim the active bit; anything else means
-		 * the table does not follow the semantics assumed here. */
-		if (!!(attrs & ATTR_ACTIVE) == !!(other_attrs & ATTR_ACTIVE))
+	/* The running slot has to look like the one ABL chose. */
+	if ((attrs & ATTR_PRIORITY_MASK) != ATTR_PRIORITY_MASK ||
+	    !(attrs & ATTR_ACTIVE) ||
+	    (!(attrs & ATTR_TRIES_MASK) && !(attrs & ATTR_SUCCESSFUL)))
+		goto out;
+	if (op == OP_CHECK) {
+		if (!(attrs & ATTR_SUCCESSFUL) || (attrs & ATTR_UNBOOTABLE))
 			goto out;
-		if (slot == 0 && !boot_is_android(fd, pt)) {
-			fprintf(stderr, "liuqin-slot-success: boot_a does not start with "
-				"ANDROID!; refusing to hand slot A the boot\n");
-			goto out;
-		}
-		attrs = (attrs & ~ATTR_BYTE_MASK) | (AB_SLOT_ACTIVE_VAL << ATTR_SHIFT);
-		other_attrs = (other_attrs & ~ATTR_BYTE_MASK) |
-			      (AB_SLOT_INACTIVE_VAL << ATTR_SHIFT);
-		put_le64(pt + 48, attrs);
-		put_le64(bt + 48, attrs);
-		put_le64(po + 48, other_attrs);
-		put_le64(bo + 48, other_attrs);
-	} else {
-		/* The running slot has to look like the one ABL chose. */
-		if ((attrs & ATTR_PRIORITY_MASK) != ATTR_PRIORITY_MASK ||
-		    !(attrs & ATTR_ACTIVE) ||
-		    (!(attrs & ATTR_TRIES_MASK) && !(attrs & ATTR_SUCCESSFUL)))
-			goto out;
-		if (op == OP_CHECK) {
-			if (!(attrs & ATTR_SUCCESSFUL) || (attrs & ATTR_UNBOOTABLE))
-				goto out;
-			rc = 0;
-			goto out;
-		}
-		attrs |= ATTR_SUCCESSFUL;
-		attrs &= ~ATTR_UNBOOTABLE;
-		put_le64(pt + 48, attrs);
-		put_le64(bt + 48, attrs);
+		rc = 0;
+		goto out;
 	}
+	attrs |= ATTR_SUCCESSFUL;
+	attrs &= ~ATTR_UNBOOTABLE;
+	put_le64(pt + 48, attrs);
+	put_le64(bt + 48, attrs);
 	refresh_crcs(&primary);
 	refresh_crcs(&backup);
 
@@ -454,13 +404,6 @@ int main(int argc, char **argv)
 	vb = find_boot(&verify_backup, slot);
 	if (!vp || !vb || le64(vp + 48) != attrs || le64(vb + 48) != attrs)
 		goto out;
-	if (op == OP_SET_ACTIVE) {
-		vp = find_boot(&verify_primary, other);
-		vb = find_boot(&verify_backup, other);
-		if (!vp || !vb || le64(vp + 48) != other_attrs ||
-		    le64(vb + 48) != other_attrs)
-			goto out;
-	}
 	rc = 0;
 
 out:
@@ -473,10 +416,6 @@ out:
 	}
 	if (rc) {
 		fprintf(stderr, "liuqin-slot-success: refused or failed; GPT not accepted\n");
-	} else if (op == OP_SET_ACTIVE) {
-		printf("liuqin-slot-success: slot %c is active (priority 3, 7 retries); "
-		       "slot %c demoted; primary/backup GPT CRCs verified\n",
-		       slot_name[slot], slot_name[other]);
 	} else if (op == OP_MARK) {
 		printf("liuqin-slot-success: slot %c is successful; "
 		       "primary/backup GPT CRCs verified\n", slot_name[slot]);
