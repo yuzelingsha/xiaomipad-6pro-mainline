@@ -6,14 +6,16 @@
 [安装指南](FLASHING.zh-CN.md)的规则放行但未逐一真机验证。本项目仍属于实验性设备移植，
 安装时请保持有人在场，并准备恢复条件。
 
-下文所述的双系统布局已在 256 GB 机型完成真机安装：分区表完成划分，Ubuntu 安装到
-`linux_root`、`/home` 位于 `linux_home`，并从 B 槽正常启动。A 槽 Android 的首次启动、
-KernelSU 以及两个系统之间的切换尚未完成真机验证。单系统布局与双系统共用同一布局引擎，
-但尚未在真机上安装。两者均应按有人在场的实验流程对待。
+早先版本的双系统布局已在 256 GB 机型完成真机安装：分区表完成划分，Ubuntu 安装到
+`linux_root`、`/home` 位于 `linux_home`，并从 B 槽正常启动。当前版本让两个系统都从 A 槽启动，
+通过更换 `boot_a` 中的 boot 镜像在两者之间切换（见[双系统切换](#双系统切换)）。
+这一方案、两个方向的切换、Android 的首次启动以及 KernelSU 尚未完成真机验证。
+单系统布局与双系统共用同一布局引擎，但尚未在真机上安装。两者均应按有人在场的实验流程对待。
 
 ## 分区布局
 
-安装器提供两种布局，由同一套布局引擎生成；两种布局都把 Ubuntu 安装到 B 槽，A 槽留给 Android。
+安装器提供两种布局，由同一套布局引擎生成。`dual` 布局下两个系统都从 A 槽启动；
+`linux-only` 布局把 Ubuntu 安装到 B 槽、不触碰 A 槽，使通过 `--android-size` 保留的应急 Android 仍可启动。
 
 | 布局 | Android | Ubuntu 系统 | Ubuntu 用户目录 |
 | --- | --- | --- | --- |
@@ -41,9 +43,12 @@ KernelSU 以及两个系统之间的切换尚未完成真机验证。单系统�
 不触碰 `super`、`metadata` 以及任何 A 槽分区。
 
 `dual` 另外清零 `userdata` 与 `metadata` 的前 16 MiB，使 Android 首次开机重新格式化这两个分区，
-而不是读到过期的文件级加密密钥；并用用户提供的 ROM 目录恢复 A 槽的原厂 Android 启动链。
+而不是读到过期的文件级加密密钥；并用用户提供的 ROM 目录恢复 A 槽的原厂 Android 分区。
 只有与设备当前内容不一致的镜像才会被写入，且只写入 `_a` 后缀的分区。
 `super` 是 Android 稀疏镜像，无法与分区内容逐字节比对，因此选择 `dual` 时总会写入。
+
+ROM 中的 `boot.img` 例外，不会被刷入：`boot_a` 写入本项目的 boot 镜像，`boot_b` 写入同一镜像
+作为 Bootloader 的回退副本，Android 的 boot 镜像则保存在 `linux_root` 上，供下文所述的切换工具使用。
 安装器不会执行原厂 `flash_all` 脚本，除 `boot_b` 外不写入任何 `_b` 分区。
 
 ### 双系统模式的前提
@@ -57,10 +62,11 @@ KernelSU 以及两个系统之间的切换尚未完成真机验证。单系统�
 
 ### 替换 Android 侧 boot 镜像
 
-`--layout dual` 可附加 `--android-boot IMG`，将 `IMG` 写入 `boot_a`，取代 ROM 自带的
-`boot.img`。其余原厂镜像仍按固定校验值逐一核对；替换镜像本身只有在长度与原厂 `boot.img`
-完全一致、且以 Android boot 魔数开头时才被接受。其 sha256 会出现在布局计划与清除数据确认中，
-并且无论分区当前内容为何都会写入。该参数在 `dual` 以外的布局下一律拒绝。
+`--layout dual` 可附加 `--android-boot IMG`，以 `IMG` 取代 ROM 自带的 `boot.img` 作为 Android 的
+boot 镜像：它保存在 `linux_root` 上，每次切换到 Android 时写入 `boot_a`。其余原厂镜像仍按固定校验值
+逐一核对；替换镜像本身只有在长度与原厂 `boot.img` 完全一致、且头部表明其为 Android boot 镜像
+（头版本 3 或 4）时才被接受。其 sha256 会出现在布局计划与清除数据确认中。
+该参数在 `dual` 以外的布局下一律拒绝。
 
 这是在 Ubuntu 旁安装带 root 的 Android 的方式。`tools/patch-android-boot-ksu.py`
 完全在主机侧生成这样的镜像：解包原厂 `boot.img`，将 ramdisk 中的 `init` 改名为 `init.real`，
@@ -83,7 +89,7 @@ python3 tools/patch-android-boot-ksu.py \
 修改 ramdisk 会使该分区的 AVB boot 签名与 vbmeta 哈希描述符失效，
 因此生成的镜像只能在已解锁 Bootloader 的设备上启动。root 之后 Android 同样具备改写 B 槽的能力：
 `liuqin_boot_ubuntu` KernelSU 模块因此在每次开机时停用系统更新程序——
-Android 的 OTA 会改写非活动槽，而 Ubuntu 正位于该槽。
+Android 的 OTA 会改写非活动槽并将其设为活动槽，而该槽保存着 Ubuntu boot 镜像的回退副本。
 
 ## 准备
 
@@ -134,7 +140,9 @@ python3 install.py --bundle . --serial DEVICE_SERIAL \
 以及分区表的主备两份副本；随后修改分区表，下载并校验系统归档，
 把 `linux_root` 与 `linux_home` 格式化为 ext4，安装系统并提取本机校准和地址，
 写入把 `LABEL=LIUQIN_HOME` 挂载到 `/home` 的 `/etc/fstab` 条目。
-根文件系统安装成功且卸载后，才写入 `boot_b`、将 B 槽置为活动槽并重启。
+双系统布局下还会把 Ubuntu 与 Android 的 boot 镜像逐一核对校验值和头部后，放入 `linux_root` 上的切换存储区。
+根文件系统安装成功且卸载后，才写入本项目的 boot 镜像（双系统布局写入 `boot_a` 与 `boot_b`，
+单系统布局写入 `boot_b`），通过 Fastboot 选定启动槽（双系统为 A 槽，单系统为 B 槽）并重启。
 不会写入 persist，也不会重新锁定 Bootloader。备份必须放在安装包目录以外，并保持私密。
 
 分区表写入后，`sgdisk` 会校验新表，安装器随即重新读取并与计划逐项比对；
@@ -164,18 +172,109 @@ python3 install.py --bundle . --serial DEVICE_SERIAL \
 恢复出厂分区表后平板上没有可用系统，需继续执行完整安装，
 或执行原厂 ROM 的完整清刷流程。
 
+## 双系统切换
+
+双系统布局下两个系统都从 A 槽启动。切换时把另一系统的 boot 镜像写入 `boot_a`，回读核对后重启平板，
+不改变活动槽。本机 Bootloader 只通过其自身的 `fastboot --set-active` 切换槽位，该操作同时交换每一对
+`_a`/`_b` 分区的类型 GUID 以及 UFS 启动 LUN；以其他方式切换槽位会使所有镜像都无法加载。
+切换只涉及 boot 镜像：Android 的 `vendor_boot_a`、`dtbo_a`、`vbmeta_a`、`super`、`metadata` 与
+`userdata` 保持安装时的状态；Ubuntu 的 boot 镜像自带内核、设备树与 initramfs。
+
+未安装在 `boot_a` 中的镜像保存在 Ubuntu 根文件系统上：
+
+```
+/var/lib/liuqin/switch/
+  ubuntu/    boot.img  SHA256SUMS  meta.json
+  android/   boot.img  SHA256SUMS  meta.json
+  state.json switch.log
+```
+
+两组镜像均由安装器写入。该目录不在 boot 镜像启动 Ubuntu 前核对的文件清单之内，
+修改它不会妨碍 Ubuntu 启动。`boot_b` 保存 Ubuntu boot 镜像的一份副本，
+供 `boot_a` 无法加载时 Bootloader 自动回退使用；切换工具从不写入 `boot_b`。
+
+**在 Ubuntu 中**，从应用列表打开"重启到 Android"（需要输入管理员密码），或执行：
+
+```sh
+sudo liuqin-switch status          # boot_a 与存储区当前内容
+sudo liuqin-switch verify          # 重新核对两组镜像；有任何异常即返回非零
+sudo liuqin-switch to-android      # 将 Android 镜像写入 boot_a 并重启
+```
+
+**在 Android 中**，使用 KernelSU 模块 `liuqin_boot_ubuntu` 的 WebUI 中的"Reboot to Ubuntu"按钮，
+或执行 `su -c 'sh /data/adb/modules/liuqin_boot_ubuntu/system/bin/boot-ubuntu'`。
+切换期间 Android 以只读方式挂载 Ubuntu 根分区；Android 内核无法以读写方式挂载该文件系统。
+
+`--no-reboot` 在重启前停止，`--dry-run` 只报告将要写入的内容，不写入任何数据。
+
+切换工具依次执行以下规则：
+
+- 存储区中的镜像缺失、与 `SHA256SUMS` 不符、大于 `boot_a`，或类型与所在目录不符时，
+  在任何写入之前拒绝。
+- 没有经过核对的返回途径就不切换。切换到 Android 前，存储区中必须有可用的 Ubuntu 镜像；
+  切换到 Ubuntu 前，`boot_a` 中当前的 Android 镜像必须与存储区中的副本一致——在 Ubuntu 中
+  会先将其归档，在存储区只读的 Android 中则直接拒绝。
+- 识别为本项目镜像的内容绝不会被当作 Android 镜像归档。
+- `boot_a` 按整个分区写入（镜像加零填充），同步后回读比对。回读不一致或写入失败时，
+  写回切换前系统的镜像，并以错误状态退出，不重启平板。
+- 存储保护每次开机都会为 `boot_a` 及其所在磁盘设置内核只读标志；切换工具只在写入期间清除该标志，
+  并在所有退出路径上恢复。写入 `boot_a` 期间忽略中断、挂断与终止信号。
+
+两类镜像按 boot 镜像头部区分：头版本 2、页大小 4096 字节、头部 1660 字节且内嵌设备树的是本项目的
+Ubuntu 镜像；头版本 3 或 4（头部分别为 1580 或 1584 字节）的是 Android 镜像；其他一律拒绝。
+
+**Android 的 boot 镜像发生变化时。** 在平板上直接替换 Android 的 boot 镜像（例如使用 KernelSU
+管理器的直接安装功能）会使其与存储区中的副本不一致，此后从 Android 切换到 Ubuntu 会被拒绝。
+请在主机上制作此类镜像，并在切换前从 Ubuntu 导入：
+
+```sh
+sudo liuqin-switch import-android /path/to/boot-ksu.img
+```
+
+若切换已被拒绝，可在 Android 中把 `boot_a` 复制出平板，在主机上用
+`fastboot flash boot_a <本项目 boot.img>` 恢复 Ubuntu 的 boot 镜像，再从 Ubuntu 导入该副本。
+
+**平板从 B 槽启动时。** `boot_a` 无法加载时，Bootloader 会自行切换到 B 槽，从回退副本启动 Ubuntu。
+切换工具会识别这种情况并拒绝写入，因为写入 `boot_a` 无法改变下次启动的内容。
+请在 Fastboot 模式下从主机修复：
+
+```sh
+fastboot flash boot_a /path/to/boot.img
+fastboot --set-active=a
+```
+
+切换工具无法拦截的写入中断（例如断电）会导致相同的结果，修复方法相同。
+
+**验证状态。** 切换工具的判定与校验逻辑已由主机侧测试覆盖，这些测试以普通文件代替分区运行。
+两个方向的切换、Android 侧的只读挂载，以及切换后任一系统从 A 槽冷启动，均尚未在平板上执行。
+早先版本中 Ubuntu 曾从 B 槽启动；从 A 槽启动时 Bootloader 会搭配 A 槽的原厂 `dtbo_a` 与
+`vbmeta_a`，这一组合尚未测试。
+
+**升级早先的双系统安装。** 早先版本的安装从 B 槽启动 Ubuntu，且没有切换存储区。
+使用当前版本重装系统并保留 `/home`，即可迁移到新方案：
+
+```sh
+python3 install.py --bundle . --serial DEVICE_SERIAL \
+  --backup /path/to/new-private-backup --erase-userdata --layout dual \
+  --rom-dir /path/to/extracted-stock-rom --android-boot /path/to/boot-ksu.img \
+  --keep-home
+```
+
+`--android-boot` 可省略；省略时保存 ROM 自带的 `boot.img`。
+
 ## 双系统下的 Android
 
 双系统安装后的首次 Android 开机会重新格式化 `userdata` 与 `metadata`，需要数分钟。
 
-KernelSU 取得 root 是设备侧步骤，安装器不代为执行。请自行对原厂 `boot.img` 打补丁
-后写入 `boot_a`，或使用 KernelSU 管理器自带的打补丁并刷入功能。
+安装器不会代为取得 KernelSU root。请按上文在主机上生成打过补丁的镜像，安装时通过
+`--android-boot` 传入，或之后在 Ubuntu 中用 `liuqin-switch import-android` 导入。
+不要直接把它刷入 `boot_a`。
 
 **切勿使用 KernelSU 管理器的"安装到未使用的槽位"。** 未使用的槽位是 B 槽，
-其中是 Ubuntu；该操作会覆盖 Ubuntu 的 boot 镜像。
+其中保存着 Ubuntu boot 镜像的回退副本。
 
-**必须冻结系统更新。** MIUI / HyperOS 的 OTA 会写入未使用的槽位，即 Ubuntu 所在的槽位，
-会直接破坏 Ubuntu 安装。
+**必须冻结系统更新。** MIUI / HyperOS 的 OTA 会写入未使用的槽位（B 槽）并将其设为活动槽。
+Android 无法从 B 槽启动，该更新还会破坏 Ubuntu boot 镜像的回退副本。
 
 **切勿再次执行原厂 `flash_all` 脚本。** 该脚本绝大多数镜像使用 `_ab` 后缀，
 即一次写入两个槽位，并在结尾执行 `fastboot set_active a`。

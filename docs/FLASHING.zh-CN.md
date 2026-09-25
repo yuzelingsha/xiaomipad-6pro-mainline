@@ -11,8 +11,8 @@
 
 Xiaomi Pad 6 Pro，代号 `liuqin`，芯片 SM8475。其他小米平板型号不兼容。
 首次安装和首启验证在 **256 GB 机型**上完成；Android 恢复仍未独立验证。
-128 GB 与 512 GB 容量变体按下方规则放行，但未逐一真机验证；自定义分区布局及
-B 槽安装不支持。不得修改常量或跳过检查来强行安装。
+128 GB 与 512 GB 容量变体按下方规则放行，但未逐一真机验证；自定义分区布局不支持。
+不得修改常量或跳过检查来强行安装。
 
 程序要求 Bootloader 已解锁且 A 槽活动，并在设备侧核对以下 Linux sysfs 数值
 （容量单位为 512 字节扇区，不是文件系统块大小）：
@@ -29,8 +29,8 @@ PARTNAME 解析目标分区。型号、槽位或会话身份无法确认时，�
 
 ## 数据与恢复
 
-Ubuntu 将使用 Android 的 userdata 分区。首次安装会清除数据，不提供 Android
-双系统启动。解锁 Bootloader 也会清除用户数据。
+单系统布局把 Android userdata 分区的空间交给 Ubuntu；双系统布局缩小该分区，
+在 Ubuntu 旁保留 Android。两种首次安装都会清除数据，解锁 Bootloader 也会清除用户数据。
 
 安装前需要：
 
@@ -45,6 +45,16 @@ Ubuntu 将使用 Android 的 userdata 分区。首次安装会清除数据，不
 恢复 Android 需要还原适配的原厂固件，并为 Android 重新准备 userdata。
 仅替换 boot 镜像不能撤销 Ubuntu 安装。设备上仍有非原厂启动镜像时，应保持
 Bootloader 解锁。
+
+## 双系统
+
+双系统布局下两个系统都从 A 槽启动。切换时把另一系统的 boot 镜像写入 `boot_a`，
+回读核对后重启平板；未使用的镜像保存在 Ubuntu 根文件系统上。切换不会改变活动槽；
+`boot_b` 保存 Ubuntu boot 镜像的一份副本，`boot_a` 无法加载时由 Bootloader 自动使用。
+Ubuntu 提供"重启到 Android"入口，Android 通过 KernelSU 模块提供"Reboot to Ubuntu"按钮。
+
+两个方向的切换均尚未经真机验证。命令、安全规则与修复方法见
+[双系统切换](INSTALL-TESTING.zh-CN.md#双系统切换)。
 
 ## 发布内容
 
