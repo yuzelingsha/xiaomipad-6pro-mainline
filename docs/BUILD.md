@@ -21,7 +21,7 @@ On Ubuntu 24.04, install the kernel build dependencies:
 ```sh
 sudo apt-get update
 sudo apt-get install build-essential bc bison flex libssl-dev libelf-dev \
-  gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu python3 git ccache kmod rsync
+  gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu python3 git ccache kmod rsync
 ```
 
 From the project checkout:

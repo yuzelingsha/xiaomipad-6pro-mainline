@@ -25,7 +25,9 @@ jobs:
           else
             base="${{ github.event.before }}"
           fi
-          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+          # A rewritten branch may leave the previous commit outside this checkout.
+          # In that case build instead of treating a failed diff as no changes.
+          if [ -z "$base" ] || ! git -C project cat-file -e "$base^{commit}" 2>/dev/null; then
             echo 'needed=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
