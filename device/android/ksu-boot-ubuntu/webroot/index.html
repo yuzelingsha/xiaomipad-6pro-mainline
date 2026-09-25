@@ -80,18 +80,19 @@ pre {
 <body>
 <main>
   <h1>Boot to Ubuntu</h1>
-  <p class="lede">Android runs from slot A on this tablet, mainline Ubuntu from slot B.</p>
+  <p class="lede">Both systems boot from slot A. The button writes the Ubuntu boot image into boot_a, reads it back, and restarts the tablet. The active slot is never changed.</p>
 
   <div class="card">
     <dl>
-      <dt>Slots</dt><dd id="slots">…</dd>
-      <dt>Current</dt><dd id="current">…</dd>
+      <dt>Slot A holds</dt><dd id="holds">…</dd>
+      <dt>Ubuntu image</dt><dd id="ubuntu">…</dd>
+      <dt>Android copy</dt><dd id="android">…</dd>
     </dl>
   </div>
 
   <div class="card">
     <button id="go" disabled>Reboot to Ubuntu</button>
-    <pre id="log">Checking the boot slots…</pre>
+    <pre id="log">Reading the switch store…</pre>
   </div>
 </main>
 <script>
@@ -99,14 +100,14 @@ pre {
 // callbackName): it runs the command as root and calls window[callbackName]
 // with (errno, stdout, stderr).  Wrapped in a promise here.
 let seq = 0;
-function exec(command) {
+function exec(command, timeoutMs) {
   return new Promise((resolve, reject) => {
     if (typeof ksu === 'undefined' || !ksu.exec) {
       reject(new Error('KernelSU WebUI bridge is not available'));
       return;
     }
     const name = '__ksu_cb_' + (seq++);
-    const timer = setTimeout(() => { delete window[name]; reject(new Error('timed out')); }, 15000);
+    const timer = setTimeout(() => { delete window[name]; reject(new Error('timed out')); }, timeoutMs);
     window[name] = (errno, stdout, stderr) => {
       clearTimeout(timer);
       delete window[name];
@@ -122,8 +123,17 @@ function exec(command) {
   });
 }
 
-const slotsEl = document.getElementById('slots');
-const currentEl = document.getElementById('current');
+// Called by its module path, not through PATH: whether KernelSU mounts the
+// module's system/ over /system differs between builds, and the module
+// directory is a real path either way.  The switcher hashes a 192 MiB
+// partition and both stored images, so the timeouts are generous.
+const MODULE = '/data/adb/modules/liuqin_boot_ubuntu';
+const SWITCH = 'LIUQIN_SWITCH_LOG=/data/adb/ksu/log/liuqin-switch.log sh ' +
+  MODULE + '/system/bin/liuqin-switch';
+
+const holdsEl = document.getElementById('holds');
+const ubuntuEl = document.getElementById('ubuntu');
+const androidEl = document.getElementById('android');
 const logEl = document.getElementById('log');
 const button = document.getElementById('go');
 
@@ -132,48 +142,47 @@ function say(text, bad) {
   logEl.classList.toggle('bad', Boolean(bad));
 }
 
+function field(text, pattern) {
+  const match = text.match(pattern);
+  return match ? match[1].trim() : '?';
+}
+
 async function refresh() {
   try {
-    const slots = await exec('bootctl get-number-slots');
-    const current = await exec('bootctl get-current-slot');
-    const slotCount = slots.stdout.trim();
-    const currentSlot = current.stdout.trim();
-    slotsEl.textContent = slotCount || '?';
-    currentEl.textContent = currentSlot === '0' ? '0 (A, Android)'
-      : currentSlot === '1' ? '1 (B, Ubuntu)' : (currentSlot || '?');
-    if (slots.errno || current.errno) {
-      say('bootctl failed: ' + (slots.stderr || current.stderr || 'unknown error'), true);
+    const status = await exec(SWITCH + ' status', 120000);
+    const text = status.stdout;
+    holdsEl.textContent = field(text, /^boot_a holds:\s*(.*)$/m);
+    ubuntuEl.textContent = field(text, /^store\/ubuntu\s+(.*)$/m);
+    androidEl.textContent = field(text, /^store\/android\s+(.*)$/m);
+    if (status.errno) {
+      say('liuqin-switch status failed:\n' + (status.stderr || status.stdout), true);
       return;
     }
-    if (slotCount !== '2') {
-      say('This device does not report two boot slots; refusing.', true);
-      return;
-    }
-    if (currentSlot !== '0') {
-      say('Already running from slot B. Nothing to switch.', true);
+    if (!/^store\/ubuntu\s+ok\b/m.test(text)) {
+      say('The Ubuntu root carries no usable Ubuntu boot image; refusing.\n\n' + text, true);
       return;
     }
     button.disabled = false;
-    say('Ready. The button sets slot B active and restarts the tablet.');
+    say(text.trim());
   } catch (error) {
     say(String(error && error.message ? error.message : error), true);
   }
 }
 
 button.addEventListener('click', async () => {
-  if (!confirm('Set the active boot slot to B and restart into Ubuntu now?\n\nUnsaved work in Android will be lost.')) {
+  if (!confirm('Write the Ubuntu boot image into boot_a and restart into Ubuntu now?\n\nUnsaved work in Android will be lost.')) {
     return;
   }
   button.disabled = true;
-  say('Switching slot…');
+  say('Writing and verifying boot_a. The tablet restarts as soon as the image reads back correctly…');
   try {
-    const result = await exec('bootctl set-active-boot-slot 1 && sleep 1 && reboot');
+    const result = await exec(SWITCH + ' to-ubuntu', 300000);
     if (result.errno) {
       button.disabled = false;
-      say('Failed (errno ' + result.errno + '): ' + (result.stderr || result.stdout), true);
+      say('Not switched (exit ' + result.errno + '):\n' + (result.stderr || '') + (result.stdout || ''), true);
       return;
     }
-    say('Slot B is active. Rebooting…');
+    say(result.stdout.trim() + '\n\nRebooting…');
   } catch (error) {
     button.disabled = false;
     say(String(error && error.message ? error.message : error), true);

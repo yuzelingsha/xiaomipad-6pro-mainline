@@ -3,12 +3,16 @@
 #
 # Keep Android from taking an over-the-air update on a dual-boot tablet.
 #
-# The two systems share one disk.  An Android OTA is written through the A/B
-# update engine, which rewrites the inactive slot -- slot B, where mainline
-# Ubuntu lives.  Accepting one would therefore destroy the Ubuntu installation
-# and leave a partition table the Android updater does not expect.  This
-# script disables the system updater application for the primary user once per
-# boot; KernelSU runs service.sh exactly once, in late start.
+# The two systems share one disk and both boot from slot A.  An Android OTA
+# is written through the A/B update engine, which rewrites the inactive slot
+# -- slot B -- and then makes it the active one.  Slot B holds the
+# bootloader's fallback copy of the Ubuntu boot image, and Android cannot run
+# from it at all: super has room for one dynamic-partition set only.
+# Accepting an OTA would therefore destroy the fallback, hand the next boot to
+# a slot that cannot start, and leave a partition table the Android updater
+# does not expect.  This script disables the system updater application for
+# the primary user once per boot; KernelSU runs service.sh exactly once, in
+# late start.
 #
 # Nothing here is irreversible: `pm enable com.android.updater` restores the
 # application, and removing the module removes this script.

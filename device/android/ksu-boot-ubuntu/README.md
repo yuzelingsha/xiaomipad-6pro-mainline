@@ -1,41 +1,90 @@
 # `liuqin_boot_ubuntu` — KernelSU module: Android → Ubuntu
 
-Android-side half of the liuqin dual-boot switch. The Ubuntu-side half is
-`/usr/local/bin/liuqin-boot-android`, shipped in the `liuqin-device-support`
-package.
+Android-side half of the liuqin dual-boot switch. The Ubuntu-side half is the
+same program, `/usr/local/sbin/liuqin-switch`, shipped in the
+`liuqin-device-support` package together with a **Reboot to Android** desktop
+entry.
 
-The layout is fixed and asymmetric: **Android always runs from slot A, mainline
-Ubuntu always from slot B.** `super` is 8.5 GiB and one Android dynamic-partition
-set is about 7.24 GiB, so a second Android cannot exist in slot B; Ubuntu is the
-side that moves. This module therefore only ever selects slot 1.
+## How switching works
+
+**Both systems boot from slot A.** Switching writes the other system's boot
+image into `boot_a`, reads it back and restarts the tablet. The active slot is
+never changed.
+
+Slot switching is not used because this bootloader does not switch slots by
+attribute bits alone: it couples them to a type-GUID swap on every `_a`/`_b`
+partition pair and to the UFS boot LUN, and a switch that changes only part of
+that state leaves every image failing to load. Android also cannot run from
+slot B at all, since `super` has room for one dynamic-partition set only.
+
+The image that is not installed is kept on the Ubuntu root filesystem
+(`linux_root`, inside its `native-root` directory):
+
+```
+/var/lib/liuqin/switch/
+  ubuntu/    boot.img  SHA256SUMS  meta.json
+  android/   boot.img  SHA256SUMS  meta.json
+  state.json switch.log
+```
+
+`boot_b` holds a copy of the Ubuntu boot image. It is there only for the
+bootloader's own fallback when `boot_a` does not load; nothing in this module
+or in the switcher writes it.
 
 ## Contents
 
 | Path | What it is |
 |---|---|
 | `module.prop` | KernelSU module metadata |
-| `system/bin/boot-ubuntu` | terminal command (`su -c boot-ubuntu`) |
+| `system/bin/liuqin-switch` | the switcher; packed from `device/gnome-overlay/usr/local/sbin/liuqin-switch` when the zip is built, so both systems run the same script |
+| `system/bin/boot-ubuntu` | terminal command: confirmation, then `liuqin-switch to-ubuntu` |
 | `service.sh` | boot-time guard that disables the Android system updater |
-| `webroot/index.html` | the KernelSU WebUI page: state read-out plus one button |
+| `webroot/index.html` | the KernelSU WebUI page: the switcher's status plus one button |
 | `META-INF/com/google/android/*` | stub that refuses a recovery sideload |
 
-Nothing here writes the GPT. Both entry points call the vendor `bootctl`
-(the `boot_control` HAL), which owns the Qualcomm A/B attribute bits on the
-Android side, exactly as `fastboot --set-active` does:
+## What "Reboot to Ubuntu" does on Android
 
-```
-bootctl set-active-boot-slot 1 && sleep 1 && reboot
+1. Mounts `/dev/block/by-name/linux_root` **read-only** (`ro,noload`) on
+   `/mnt/liuqin-switch`. The Android kernel (5.10) cannot mount this ext4
+   read-write, and the switch must not replay its journal either, so the
+   Android side never writes the store.
+2. Checks `ubuntu/boot.img` against its `SHA256SUMS` and against the header
+   rule below, and that it fits `boot_a`.
+3. Checks that `boot_a` holds exactly the image in `android/` — the way back.
+   If Android's boot image has changed since it was archived (a KernelSU
+   re-patch, a manually flashed image), the switch is refused and nothing is
+   written, because overwriting `boot_a` would destroy the only copy. The new
+   image then has to reach the store from the Ubuntu side with
+   `liuqin-switch import-android <image>`.
+4. Clears the kernel read-only flag of `boot_a` and its disk if set, writes the
+   whole partition (image plus zero fill), syncs, restores the flag, reads the
+   partition back and compares it. A mismatch writes the Android image back
+   and stops without rebooting.
+5. Unmounts the store and reboots with `svc power reboot`.
+
+Images are told apart by their boot-image header: header version 2 with a
+4096-byte page, a 1660-byte header and a DTB is the project's Ubuntu image;
+header version 3 or 4 (header size 1580 or 1584) is Android; anything else is
+refused.
+
+From a root shell, the switcher can always be called by its module path,
+whether or not KernelSU mounts the module's `system/` over `/system`:
+
+```sh
+su -c 'sh /data/adb/modules/liuqin_boot_ubuntu/system/bin/liuqin-switch status'
+su -c 'sh /data/adb/modules/liuqin_boot_ubuntu/system/bin/boot-ubuntu'
 ```
 
-Both entry points refuse before touching anything when `bootctl get-number-slots`
-is not `2` or `bootctl get-current-slot` is not `0`.
+`boot-ubuntu -n` reports what would be written without writing anything. The
+switcher's own log goes to `/data/adb/ksu/log/liuqin-switch.log`, because the
+store is read-only here; the WebUI calls the script by the same module path.
 
 ## OTA freeze
 
-Both systems share one disk, and an Android over-the-air update is applied by
-the A/B update engine, which writes the **inactive** slot. On this layout the
-inactive slot is B, where mainline Ubuntu lives, so accepting an OTA would
-overwrite the Ubuntu installation.
+An Android over-the-air update is applied by the A/B update engine, which
+writes the **inactive** slot — slot B — and then makes it active. That would
+overwrite the fallback copy of the Ubuntu boot image and hand the next boot to
+a slot from which Android cannot start.
 
 `service.sh` therefore runs once per boot — KernelSU starts it in late start —
 waits for `sys.boot_completed`, and disables the system updater for the primary
@@ -59,31 +108,40 @@ table first, update, then install again.
 Build the zip and install it from the KernelSU manager:
 
 ```
-sh tools/build-ksu-module.sh          # -> out/ksu-module/liuqin_boot_ubuntu-v0.2.zip
+sh tools/build-ksu-module.sh          # -> out/ksu-module/liuqin_boot_ubuntu-v0.3.zip
 ```
 
 Recovery sideload is deliberately rejected — it would unpack the files outside
 KernelSU's module directory.
 
-## 待真机核实
+## Untested on hardware (待真机核实)
 
-- **WebUI API shape.** The page calls `ksu.exec(command, optionsJson, callbackName)`
-  and expects `window[callbackName](errno, stdout, stderr)`. This is the widely
-  documented KernelSU WebUI bridge, but there is **no local file in this repo
-  that documents it**, so it was not verified against a citation and has not
-  run on hardware. If the manager's bridge differs, only `exec()` in
-  `webroot/index.html` needs to change.
-- **KernelSU flavour.** Resolved on the host side: the stock kernel is GKI
-  `5.10.209-android12-9`, KMI `android12-5.10`, and upstream KernelSU ships a
-  matching loadable module for it. `tools/patch-android-boot-ksu.py` builds the
-  patched Android boot image; the assets are pinned in
-  `tools/lib/kernelsu-assets.json`. Whether the tablet boots that image, and
-  whether the manager then reports root, is still untested.
+None of the following has run on the tablet yet. The switcher's decision and
+verification logic is covered by `tests/switch-selftest.sh`, which runs it
+against ordinary files and says nothing about the device.
+
+- **The switch itself.** Writing `boot_a` from Android, the read-back after the
+  page-cache flush, and the cold boot into Ubuntu from slot A have not been
+  performed.
+- **Read-only mount.** `mount -t ext4 -o ro,noload` from the KernelSU root
+  shell, under Android's SELinux policy and mount namespaces, is untested.
+- **Block-device access.** That toybox `blockdev` and `dd` can write `boot_a`
+  from the KernelSU `su` domain is untested.
+- **WebUI API shape.** The page calls `ksu.exec(command, optionsJson,
+  callbackName)` and expects `window[callbackName](errno, stdout, stderr)`.
+  This is the widely documented KernelSU WebUI bridge, but no local file in
+  this repository documents it. If the manager's bridge differs, only `exec()`
+  in `webroot/index.html` needs to change. Whether the callback arrives before
+  the reboot is also untested; the terminal command is the fallback.
+- **KernelSU flavour.** The stock kernel is GKI `5.10.209-android12-9`, KMI
+  `android12-5.10`, and upstream KernelSU ships a matching loadable module for
+  it. `tools/patch-android-boot-ksu.py` builds the patched Android boot image;
+  the assets are pinned in `tools/lib/kernelsu-assets.json`. Whether the tablet
+  boots that image, and whether the manager then reports root, is untested.
+- **Slot suffix on Android.** The switcher reads `ro.boot.slot_suffix` to
+  refuse a switch while running from slot B; the property has not been read on
+  this tablet.
 - **Updater package name.** `com.android.updater` is the system updater on this
   ROM generation, but it has not been read off the tablet. `service.sh` logs
   `is not installed for user 0` when the name is wrong, so the log answers the
   question on the first boot.
-- **`bootctl` path.** Assumed `/system/bin/bootctl`; override with `BOOTCTL=`.
-- **`reboot` from the WebUI.** Whether the manager's shell context survives long
-  enough for `sleep 1 && reboot` to land, or whether the callback is lost first,
-  is untested. The terminal command is the fallback.
