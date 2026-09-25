@@ -36,7 +36,7 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
-          gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu python3 ccache kmod rsync
+          gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu python3 ccache kmod rsync
     - uses: actions/cache@v4
       with:
         path: ~/.cache/ccache
@@ -56,6 +56,17 @@ runs:
           sh project/tools/build-liuqin-kernel-modules.sh
         cd project/out/kernel-modules
         sha256sum modules.tar modules.manifest kernel.release kernel.commit > SHA256SUMS
+    - name: Preserve failed configuration
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: liuqin-config-failure-${{ steps.source.outputs.sha }}
+        if-no-files-found: ignore
+        include-hidden-files: true
+        path: |
+          project/out/kernel/.config
+          project/out/kernel/build-inputs.json
+        retention-days: 7
     - uses: actions/upload-artifact@v4
       with:
         name: liuqin-kernel-${{ steps.source.outputs.sha }}

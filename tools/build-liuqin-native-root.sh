@@ -105,7 +105,12 @@ cat >/tmp/liuqin-apt.conf <<'APT'
 #clear DPkg::Post-Invoke;
 APT
 apt-get -c /tmp/liuqin-apt.conf update >/dev/null
-apt-get -c /tmp/liuqin-apt.conf install -y --no-install-recommends libqrtr1 libprotobuf-c1 >/dev/null
+# The camera application and its codec plugins are image content, not
+# dependencies of liuqin-device-support: removing Snapshot or a codec must
+# never take the device units with it.  ugly/libav carry the H.264 encoder
+# and decoder that Snapshot recording and in-app playback use.
+apt-get -c /tmp/liuqin-apt.conf install -y --no-install-recommends libqrtr1 libprotobuf-c1 \
+	gnome-snapshot libcamera-ipa gstreamer1.0-libcamera gstreamer1.0-libav gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly >/dev/null
 dpkg -i /tmp/liuqin-debs/liuqin-firmware_*_all.deb \
 	/tmp/liuqin-debs/liuqin-device-support_*_arm64.deb \
 	/tmp/liuqin-debs/liuqin-sensors_*_arm64.deb \

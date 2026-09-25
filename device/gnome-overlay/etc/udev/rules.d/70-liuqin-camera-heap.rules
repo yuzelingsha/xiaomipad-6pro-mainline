@@ -1,0 +1,2 @@
+# libcamera software ISP buffers; allow video-group and active-seat access.
+SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660", TAG+="uaccess"
