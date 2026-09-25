@@ -3,13 +3,40 @@
 # Device-side installer, intended only for the dedicated read-only RAM image.
 set -eu
 die() { printf 'liuqin-install: %s\n' "$*" >&2; exit 1; }
-[ "$#" = 7 ] || [ "$#" = 8 ] ||
-	die 'usage: install-root.sh BOOT_ID ROOTFS_URL SHA256 BYTES ERASE-LIUQIN-USERDATA ROOT_PARTNAME HOME_PARTNAME [ENABLE-USB-RESCUE]'
+usage='usage: install-root.sh BOOT_ID ROOTFS_URL SHA256 BYTES ERASE-LIUQIN-USERDATA ROOT_PARTNAME HOME_PARTNAME [ENABLE-USB-RESCUE] [SWITCH-STORE ubuntu URL SHA256 BYTES android URL SHA256 BYTES]'
+[ "$#" -ge 7 ] || die "$usage"
 [ "$5" = ERASE-LIUQIN-USERDATA ] || die 'explicit data-erasure acknowledgement required'
 root_name=$6
 home_name=$7
-rescue=${8:-}
+# The dual layout adds the switch store: the Ubuntu and Android boot images
+# that liuqin-switch rotates through boot_a, fetched from the host like the
+# root archive.  Its eight arguments are always last.
+rescue=
+store_at=
+case $# in
+7) ;;
+8) rescue=$8 ;;
+16) store_at=8 ;;
+17) rescue=$8; store_at=9 ;;
+*) die "$usage" ;;
+esac
 case $rescue in ''|ENABLE-USB-RESCUE) ;; *) die 'unsupported rescue option' ;; esac
+switch_store=${0%/*}/install-switch-store.sh
+store_ubuntu_url='' store_ubuntu_sha='' store_ubuntu_bytes=''
+store_android_url='' store_android_sha='' store_android_bytes=''
+store_fields() { # <index of SWITCH-STORE> "$@"
+	sf_skip=$1
+	shift
+	shift $((sf_skip - 1))
+	[ "$1" = SWITCH-STORE ] || die 'unsupported option; expected SWITCH-STORE'
+	shift
+	[ -f "$switch_store" ] || die 'the switch-store step is missing from the installer image'
+	# Validate everything before anything is formatted.
+	sh "$switch_store" --check "$@"
+	store_ubuntu_url=$2 store_ubuntu_sha=$3 store_ubuntu_bytes=$4
+	store_android_url=$6 store_android_sha=$7 store_android_bytes=$8
+}
+[ -z "$store_at" ] || store_fields "$store_at" "$@"
 [ "$(cat /proc/sys/kernel/random/boot_id)" = "$1" ] || die 'RAM boot identity changed'
 [ "$(cat /etc/liuqin-installer 2>/dev/null)" = liuqin ] || die 'not the installer RAM image'
 ln -sf /proc/self/fd/0 /dev/stdin
@@ -138,6 +165,11 @@ if [ -d /mnt/install/native-root/home ]; then
 		--xattrs-include='*' | /usr/bin/tar -C /mnt/install-home -xf - \
 		--numeric-owner --same-owner --same-permissions --acls --xattrs --xattrs-include='*' \
 		--warning=no-timestamp
+fi
+if [ -n "$store_at" ]; then
+	sh "$switch_store" /mnt/install/native-root \
+		ubuntu "$store_ubuntu_url" "$store_ubuntu_sha" "$store_ubuntu_bytes" \
+		android "$store_android_url" "$store_android_sha" "$store_android_bytes"
 fi
 {
 	printf '# Written by the liuqin installer. The root filesystem is mounted by\n'

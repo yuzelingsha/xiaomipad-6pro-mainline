@@ -7,6 +7,10 @@
     "against.  The ROM itself is an upstream input and is not redistributed",
     "here.  'partition' is always the _a slot name (or the non-slotted super);",
     "the installer never writes _b apart from boot_b with the project image.",
+    "boot.img is the exception to flashing: in the dual layout both systems",
+    "boot from slot A, so boot_a receives the project image and boot.img (or",
+    "the --android-boot override) is stored on the Ubuntu root, from where",
+    "liuqin-switch writes it to the 'partition' named here.",
     "'sparse' marks an Android sparse image, whose bytes cannot be compared",
     "against the partition content, so it is always flashed when requested."
   ],

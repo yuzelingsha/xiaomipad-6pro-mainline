@@ -1234,12 +1234,14 @@ fi
 if [ "$storage_mode" = persistent ] && [ "$ufs_safe" = true ]; then
 	if storage_prepare_persistent_root; then
 		slot_success_ok=true
-		# Mark the slot this boot actually came from.  Ubuntu lives in slot
-		# B once the dual-boot layout is in place and in slot A before it,
-		# so the suffix -- not a constant -- decides.  A cmdline without a
-		# usable suffix means the ABL A/B state cannot be reasoned about,
-		# and a persistent handoff that never marks the slot successful
-		# would be rolled back by the retry counter: refuse instead.
+		# Mark the slot this boot actually came from.  The dual layout
+		# boots Ubuntu from slot A and only reaches slot B when the
+		# bootloader has fallen back to the copy kept in boot_b; the
+		# Linux-only layout boots it from slot B.  So the suffix -- not a
+		# constant -- decides.  A cmdline without a usable suffix means the
+		# ABL A/B state cannot be reasoned about, and a persistent handoff
+		# that never marks the slot successful would be rolled back by the
+		# retry counter: refuse instead.
 		if slot_from_cmdline "$(cat /proc/cmdline)"; then
 			if /bin/liuqin-mark-slot-successful --check "$slot_suffix"; then
 				log "persistent root release: slot $slot_suffix was already successful"

@@ -42,7 +42,7 @@ fail() { printf 'test-liuqin-layout: %s\n' "$*" >&2; exit 1; }
 # explain why it must not be used, and only code that runs on the tablet is
 # under test here.
 for device_script in tools/lib/install-layout.sh tools/lib/install-root.sh \
-	tools/provision-liuqin-from-persist.sh initramfs/init; do
+	tools/lib/install-switch-store.sh tools/provision-liuqin-from-persist.sh initramfs/init; do
 	[ -f "$project_root/$device_script" ] ||
 		fail "no such device-side script: $device_script"
 	! sed 's/^[[:space:]]*#.*$//' "$project_root/$device_script" |

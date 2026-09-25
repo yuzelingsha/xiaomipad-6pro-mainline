@@ -18,10 +18,25 @@ import threading
 import time
 import uuid
 
-# Slot assignment is fixed and is not a layout decision: Android keeps the
-# stock boot chain in slot A, Ubuntu always installs into slot B.
-UBUNTU_SLOT = 'b'
-ANDROID_SLOT = 'a'
+# Slot assignment.  In the dual layout both systems boot from slot A: the
+# project boot image goes to boot_a, Android's boot image is kept in the switch
+# store on the Ubuntu root, and liuqin-switch rotates the two through boot_a.
+# The stock bootloader switches slots only through its own fastboot
+# --set-active, which swaps the type GUIDs of every _a/_b pair and the UFS boot
+# LUN together; nothing on the tablet can do that, so switching never changes
+# the slot.  boot_b receives the same project image as the bootloader's own
+# fallback when boot_a does not load.
+#
+# The Linux-only layout keeps its original assignment, Ubuntu in slot B, so
+# that an emergency Android kept with --android-size stays bootable from the
+# untouched slot A.  It has no switch store.
+DUAL_UBUNTU_SLOT = 'a'
+DUAL_FALLBACK_SLOT = 'b'
+LINUX_ONLY_UBUNTU_SLOT = 'b'
+# The stock (or --android-boot) boot image is not flashed in the dual layout:
+# it is stored for liuqin-switch and served to the RAM installer under this name.
+ANDROID_BOOT_IMAGE = 'boot.img'
+ANDROID_BOOT_URL = 'android-boot.img'
 # Every layout operation resolves the disk through a partition that exists in
 # every state of this installation: persist is never created, moved or removed.
 ANCHOR = 'persist'
@@ -103,7 +118,7 @@ def parse_arguments(argv=None):
     parser.add_argument('--erase-userdata', action='store_true')
     parser.add_argument('--layout', choices=list(layout.MODES),
                         help='linux-only: Ubuntu is the only system. '
-                             'dual: keep a stock Android in slot A alongside it')
+                             'dual: keep a stock Android alongside it; both boot from slot A')
     parser.add_argument('--android-size', help='Android userdata size as NNG or NN%% '
                                                '(0 deletes the partition; default 96G dual, 0 linux-only)')
     parser.add_argument('--root-size', help='linux_root size as NNG or NN%% (default 32G); '
@@ -113,9 +128,10 @@ def parse_arguments(argv=None):
     parser.add_argument('--rom-dir', type=Path,
                         help='Extracted stock Fastboot ROM directory; required by --layout dual')
     parser.add_argument('--android-boot', type=Path, metavar='IMG',
-                        help='Flash this boot image to the Android slot instead of the stock '
-                             'boot.img; only applies to --layout dual. Every other stock image '
-                             'is still verified against the pinned checksums.')
+                        help='Keep this boot image as Android\'s boot image instead of the stock '
+                             'boot.img; only applies to --layout dual. It is stored on the Ubuntu '
+                             'root and written to boot_a by liuqin-switch. Every other stock '
+                             'image is still verified against the pinned checksums.')
     parser.add_argument('--restore-partition-table', type=Path, metavar='BACKUP_DIR',
                         help='Restore the partition table saved in an earlier backup directory and stop')
     parser.add_argument('--yes', action='store_true', help='Skip the interactive data-erasure confirmation')
@@ -173,14 +189,38 @@ def validate_arguments(parser, args, preview=False):
         parser.error('--rom-dir only applies to --layout dual')
 
 
+def boot_image_kind(header):
+    """The header rule liuqin-switch and the store step apply, in Python.
+
+    'ubuntu': header v2, 4096-byte page, 1660-byte header, a DTB.
+    'android': header v3 (1580-byte header) or v4 (1584-byte header).
+    Both need the ANDROID! magic and a kernel; anything else is 'unknown'.
+    """
+    if len(header) < 1652 or header[:8] != b'ANDROID!':
+        return 'unknown'
+
+    def u32(offset):
+        return int.from_bytes(header[offset:offset + 4], 'little')
+
+    version, kernel = u32(40), u32(8)
+    if kernel == 0:
+        return 'unknown'
+    if version == 2 and u32(36) == 4096 and u32(1644) == 1660 and u32(1648) > 0:
+        return 'ubuntu'
+    if (version, u32(20)) in ((3, 1580), (4, 1584)):
+        return 'android'
+    return 'unknown'
+
+
 def check_android_boot(parser, path):
     """Accept an Android boot override only if it can occupy the stock partition.
 
-    The image replaces a verified stock image, so it is held to the two
-    properties that can be checked without a device: it is exactly as long as
-    the stock boot.img the pinned table describes, and it starts with the
-    Android boot magic.  Its content is the operator's responsibility and its
-    checksum is printed wherever the plan is shown.
+    The image replaces a verified stock image, so it is held to the properties
+    that can be checked without a device: it is exactly as long as the stock
+    boot.img the pinned table describes, and its header identifies it as an
+    Android (v3/v4) boot image, which is what liuqin-switch will require before
+    it writes the image to boot_a.  Its content is the operator's
+    responsibility and its checksum is printed wherever the plan is shown.
     """
     table = load_rom_table(parser)
     expected = table['images']['boot.img']['bytes']
@@ -191,9 +231,13 @@ def check_android_boot(parser, path):
                      f'boot.img in {table["rom"]}; {path} is {path.stat().st_size} bytes'
                      ' —— 替换镜像必须与原厂 boot 分区等长')
     with path.open('rb') as stream:
-        if stream.read(8) != b'ANDROID!':
-            parser.error('--android-boot does not start with the Android boot magic: ' + str(path) +
-                         ' —— 该文件不是 Android boot 镜像')
+        header = stream.read(4096)
+    if header[:8] != b'ANDROID!':
+        parser.error('--android-boot does not start with the Android boot magic: ' + str(path) +
+                     ' —— 该文件不是 Android boot 镜像')
+    if boot_image_kind(header) != 'android':
+        parser.error('--android-boot is not an Android boot image with header version 3 or 4: ' +
+                     str(path) + ' —— 该文件不是 v3/v4 头的 Android boot 镜像')
     return sha(path)
 
 
@@ -304,9 +348,9 @@ def main(argv=None):
         if userdata_size is not None and userdata_size < 16 * 1024 ** 3:
             parser.error('userdata is smaller than 16 GiB; only Xiaomi Pad 6 Pro (liuqin) is supported'
                          ' —— 请确认设备为小米平板 6 Pro（liuqin），不要用于其他机型')
-        # Ubuntu installs into slot B, so the project boot image must fit boot_b.
-        boot_partition = 'boot_' + UBUNTU_SLOT
-        if max((bundle / name).stat().st_size for name in ('boot.img', 'installer.img')) > partition_size(boot_partition):
+        # The project boot image must fit every boot partition it is written to.
+        largest = max((bundle / name).stat().st_size for name in ('boot.img', 'installer.img'))
+        if any(largest > partition_size('boot_' + slot) for slot in boot_slots(args.layout)):
             parser.error('boot image exceeds the reported boot partition size'
                          ' —— boot 镜像大于 boot 分区，包与设备不匹配')
         print('Layout: ' + args.layout)
@@ -322,11 +366,13 @@ def main(argv=None):
             print(f'About to REPARTITION tablet {args.serial} and erase every partition shown above.')
             print(f'即将修改平板 {args.serial} 的分区表并清空上表所列分区的全部数据。')
             if args.layout == 'dual':
-                print('Android keeps slot A and its own userdata; Ubuntu installs into slot B.')
-                print('Android 保留 A 槽与独立的 userdata；Ubuntu 安装到 B 槽。')
+                print('Both systems boot from slot A. Ubuntu\'s boot image is written to boot_a,'
+                      ' with a fallback copy in boot_b; Android keeps its own userdata, and its'
+                      ' boot image is stored on the Ubuntu root for liuqin-switch.')
+                print('两个系统都从 A 槽启动：Ubuntu 的 boot 镜像写入 boot_a，boot_b 保存一份回退副本；'
+                      'Android 保留独立的 userdata，其 boot 镜像存放在 Ubuntu 根分区，由 liuqin-switch 切换。')
                 if args.android_boot is not None:
-                    print('The Android slot will boot the supplied image instead of the stock '
-                          'boot.img:')
+                    print('Android will boot the supplied image instead of the stock boot.img:')
                     print('  ' + str(args.android_boot.resolve()))
                     print('  sha256 ' + rom_images['boot.img']['sha256'])
                     print('Android 侧将启动上述替换镜像，而非原厂 boot.img。')
@@ -374,8 +420,10 @@ def main(argv=None):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
                 route.connect((args.device_address, 2323))
                 args.host_address = route.getsockname()[0]
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(bundle))
-        server = http.server.ThreadingHTTPServer((args.host_address, 0), handler)
+        extra = {}
+        if args.layout == 'dual':
+            extra['/' + ANDROID_BOOT_URL] = rom_images[ANDROID_BOOT_IMAGE]['path']
+        server = http.server.ThreadingHTTPServer((args.host_address, 0), bundle_handler(bundle, extra))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         args.backup.mkdir(mode=0o700, parents=True)
         backups = {}
@@ -421,13 +469,17 @@ def main(argv=None):
             apply_layout(device_layout, disk, plan, saved, args.layout)
         flashes = []
         if args.layout == 'dual':
-            flashes = stock_images_to_flash(device_layout, rom_images)
-        url = f'http://{args.host_address}:{server.server_port}/rootfs.tar.gz'
-        install = ['sh', '/usr/lib/liuqin/install-root.sh', boot_id, url,
+            flashes = stock_images_to_flash(device_layout, {
+                name: entry for name, entry in rom_images.items() if name != ANDROID_BOOT_IMAGE})
+        base = f'http://{args.host_address}:{server.server_port}'
+        install = ['sh', '/usr/lib/liuqin/install-root.sh', boot_id, base + '/rootfs.tar.gz',
                    manifest['files']['rootfs.tar.gz'], str((bundle / 'rootfs.tar.gz').stat().st_size),
                    'ERASE-LIUQIN-USERDATA', layout.ROOT_NAME, layout.HOME_NAME]
         if args.enable_rescue:
             install.append('ENABLE-USB-RESCUE')
+        if args.layout == 'dual':
+            install += switch_store_arguments(base, manifest['files']['boot.img'], bundle / 'boot.img',
+                                              rom_images[ANDROID_BOOT_IMAGE])
         print('Installing Ubuntu into ' + layout.ROOT_NAME + '.', flush=True)
         result = remote(shlex.join(install), 3600)
         if b'liuqin-install: ROOT_INSTALLED' not in result:
@@ -441,19 +493,63 @@ def main(argv=None):
             time.sleep(2)
         else:
             raise RuntimeError('Return to Fastboot not observed; boot partition was not flashed')
-        for name, entry in flashes:
-            source = 'supplied' if entry.get('override') else 'stock'
-            print(f'Writing the {source} {name} to {entry["partition"]}...', flush=True)
-            fastboot('flash', entry['partition'], str(entry['path']))
-        print('Writing the matching boot image to boot_' + UBUNTU_SLOT + '...', flush=True)
-        fastboot('flash', 'boot_' + UBUNTU_SLOT, str(bundle / 'boot.img'))
-        fastboot('--set-active=' + UBUNTU_SLOT)
-        fastboot('reboot')
+        finish_in_fastboot(fastboot, args.layout, flashes, bundle / 'boot.img')
         print('Installation commands completed. First-boot verification is still required.')
     finally:
         if server:
             server.shutdown()
             server.server_close()
+
+
+def boot_slots(mode):
+    """The slots whose boot partition receives the project boot image, the
+    booting slot first."""
+    if mode == 'dual':
+        return (DUAL_UBUNTU_SLOT, DUAL_FALLBACK_SLOT)
+    return (LINUX_ONLY_UBUNTU_SLOT,)
+
+
+def finish_in_fastboot(fastboot, mode, flashes, boot_image):
+    """The fastboot tail of an installation, after the root is in place.
+
+    Stock images go to their _a partitions first, then the project boot image
+    to every slot boot_slots() names, and only then is the booting slot
+    selected -- through the bootloader's own --set-active, the one operation
+    that keeps its slot attributes, type GUIDs and boot LUN consistent.
+    """
+    for name, entry in flashes:
+        source = 'supplied' if entry.get('override') else 'stock'
+        print(f'Writing the {source} {name} to {entry["partition"]}...', flush=True)
+        fastboot('flash', entry['partition'], str(entry['path']))
+    slots = boot_slots(mode)
+    for slot in slots:
+        role = 'fallback copy of the ' if slot != slots[0] else ''
+        print(f'Writing the {role}project boot image to boot_{slot}...', flush=True)
+        fastboot('flash', 'boot_' + slot, str(boot_image))
+    fastboot('--set-active=' + slots[0])
+    fastboot('reboot')
+
+
+def switch_store_arguments(base_url, ubuntu_sha256, ubuntu_image, android_entry):
+    """install-root.sh arguments that fill liuqin-switch's store in the dual layout."""
+    return ['SWITCH-STORE',
+            'ubuntu', base_url + '/boot.img', ubuntu_sha256, str(ubuntu_image.stat().st_size),
+            'android', base_url + '/' + ANDROID_BOOT_URL, android_entry['sha256'],
+            str(Path(android_entry['path']).stat().st_size)]
+
+
+def bundle_handler(bundle, extra):
+    """Serve the bundle directory, plus the exact extra paths given (URL path to
+    file), which the dual layout uses for the Android boot image kept outside
+    the bundle.  Nothing else outside the bundle is reachable."""
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def translate_path(self, path):
+            clean = path.split('?', 1)[0].split('#', 1)[0]
+            if clean in extra:
+                return str(extra[clean])
+            return super().translate_path(path)
+
+    return functools.partial(Handler, directory=str(bundle))
 
 
 def confirm_plan(expected, actual):

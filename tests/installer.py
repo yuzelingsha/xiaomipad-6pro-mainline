@@ -18,6 +18,27 @@ spec = importlib.util.spec_from_file_location('installer', project / 'tools/inst
 installer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(installer)
 
+
+def boot_header(kind, fields=None):
+    """A 4096-byte boot image header page shaped like the real ones.
+
+    'ubuntu' is the project's v2 image (page 4096, header 1660, a DTB);
+    'android' the stock GKI v4 image (header 1584).  ``fields`` overrides
+    individual u32 fields by offset, e.g. ``{1648: 0}`` for "no DTB".
+    """
+    page = bytearray(4096)
+    page[:8] = b'ANDROID!'
+    values = {8: 1000}
+    if kind == 'ubuntu':
+        values.update({36: 4096, 40: 2, 1644: 1660, 1648: 5000})
+    elif kind == 'android':
+        values.update({8: 46000, 20: 1584, 40: 4})
+    values.update(fields or {})
+    for offset, value in values.items():
+        page[offset:offset + 4] = value.to_bytes(4, 'little')
+    return bytes(page)
+
+
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
     files = {}
@@ -89,6 +110,12 @@ with tempfile.TemporaryDirectory() as directory:
     calls = run_install([], hex(471789528 * 512), stdin_tty=True, answer='YES')
     assert calls[-1][3] == 'boot'
     print('PASS: interactive erasure confirmation gates the RAM installer boot')
+
+    # Both boot partitions are size-checked before the dual layout boots the
+    # RAM installer, because both receive the project image.
+    calls = run_install(['--yes'], hex(16 * 1024**3))
+    assert ['partition-size:boot_b'] == [c[-1] for c in calls if c[-1].startswith('partition-size:boot')], calls
+    print('PASS: the Linux-only layout checks boot_b only')
 
 # A local fake shell supplies a CRLF transcript containing the echoed command.
 # Only complete marker lines may finish the transaction, not the echo itself.
@@ -162,15 +189,22 @@ with tempfile.TemporaryDirectory() as directory:
     (root / 'bundle.json').write_text(json.dumps({'device': 'liuqin', 'files': files,
                                                   'status': 'OFFLINE_ASSEMBLED'}))
     good = root / 'android-boot-good.img'
-    good.write_bytes(b'ANDROID!' + bytes(stock_boot_bytes - 8))
+    good.write_bytes(boot_header('android') + bytes(stock_boot_bytes - 4096))
     short = root / 'android-boot-short.img'
-    short.write_bytes(b'ANDROID!' + bytes(stock_boot_bytes - 9))
+    short.write_bytes(boot_header('android') + bytes(stock_boot_bytes - 4097))
     wrong_magic = root / 'android-boot-magic.img'
-    wrong_magic.write_bytes(b'NOTABOOT' + bytes(stock_boot_bytes - 8))
+    wrong_magic.write_bytes(b'NOTABOOT' + boot_header('android')[8:] + bytes(stock_boot_bytes - 4096))
+    # A v2 image, ours, is exactly what the Android slot must never be handed.
+    ours = root / 'android-boot-v2.img'
+    ours.write_bytes(boot_header('ubuntu') + bytes(stock_boot_bytes - 4096))
+    bare = root / 'android-boot-bare.img'
+    bare.write_bytes(b'ANDROID!' + bytes(stock_boot_bytes - 8))
     check = ['python3', str(project / 'tools/install-liuqin.py'), '--bundle', str(root), '--check']
     for extra, fragment in (
             (['--layout', 'dual', '--android-boot', str(short)], b'exactly'),
             (['--layout', 'dual', '--android-boot', str(wrong_magic)], b'Android boot magic'),
+            (['--layout', 'dual', '--android-boot', str(ours)], b'header version 3 or 4'),
+            (['--layout', 'dual', '--android-boot', str(bare)], b'header version 3 or 4'),
             (['--layout', 'dual', '--android-boot', str(root / 'absent.img')], b'not a file'),
             (['--layout', 'linux-only', '--android-boot', str(good)], b'only applies to --layout dual'),
             (['--android-boot', str(good)], b'only applies to --layout dual')):
@@ -183,7 +217,7 @@ with tempfile.TemporaryDirectory() as directory:
                                       '--android-boot', str(good)], capture_output=True)
     assert restore.returncode != 0 and b'separate action' in restore.stderr, restore.stderr
 print('PASS: the Android boot override is refused unless it is a dual-layout, '
-      'partition-sized Android boot image')
+      'partition-sized v3/v4 Android boot image')
 
 # The override must replace the stock boot.img only after every other stock
 # image has been verified, and must always be written.
@@ -221,3 +255,134 @@ assert installer.LAYOUT_WORK == '/run/liuqin-layout'
 layout_script = (project / 'tools/lib/install-layout.sh').read_text()
 assert 'LIUQIN_LAYOUT_WORK:-' + installer.LAYOUT_WORK in layout_script
 print('PASS: the staged partition-table halves land in the scratch directory the RAM image has')
+
+# --- slot assignment and the fastboot tail ---------------------------------
+# The dual layout boots both systems from slot A: the project image goes to
+# boot_a and, as the bootloader's fallback, boot_b; slot A is selected through
+# fastboot itself.  The stock boot.img is never flashed there -- it is stored.
+assert installer.boot_slots('dual') == ('a', 'b')
+assert installer.boot_slots('linux-only') == ('b',)
+for mode, expected in (
+        ('dual', [['flash', 'vendor_boot_a', '/rom/vendor_boot.img'],
+                  ['flash', 'boot_a', '/bundle/boot.img'],
+                  ['flash', 'boot_b', '/bundle/boot.img'],
+                  ['--set-active=a'], ['reboot']]),
+        ('linux-only', [['flash', 'boot_b', '/bundle/boot.img'],
+                        ['--set-active=b'], ['reboot']])):
+    sent = []
+    flashes = [('vendor_boot.img', {'partition': 'vendor_boot_a', 'path': '/rom/vendor_boot.img'})] \
+        if mode == 'dual' else []
+    installer.finish_in_fastboot(lambda *a: sent.append(list(a)), mode, flashes, Path('/bundle/boot.img'))
+    assert sent == expected, (mode, sent)
+    assert not any(call[0].startswith('--set-active') and call != expected[-2] for call in sent), sent
+print('PASS: dual writes the project image to boot_a and boot_b and selects slot A; '
+      'linux-only keeps slot B')
+
+installer_source = (project / 'tools/install-liuqin.py').read_text()
+assert "'--set-active=b'" not in installer_source and '--set-active=b' not in installer_source
+assert 'stock_images_to_flash(device_layout, {' in installer_source
+assert 'if name != ANDROID_BOOT_IMAGE})' in installer_source
+print('PASS: the stock boot.img is stored for liuqin-switch, not flashed')
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    ubuntu = root / 'boot.img'
+    ubuntu.write_bytes(boot_header('ubuntu') + bytes(4096))
+    android = root / 'android.img'
+    android.write_bytes(boot_header('android') + bytes(8192))
+    arguments = installer.switch_store_arguments(
+        'http://192.168.7.1:8000', 'a' * 64, ubuntu, {'sha256': 'b' * 64, 'path': android})
+    assert arguments == ['SWITCH-STORE',
+                         'ubuntu', 'http://192.168.7.1:8000/boot.img', 'a' * 64, '8192',
+                         'android', 'http://192.168.7.1:8000/android-boot.img', 'b' * 64, '12288'], arguments
+    # install-root.sh accepts exactly this shape, validates it before touching
+    # anything, and refuses a malformed one.
+    base = ['sh', str(project / 'tools/lib/install-root.sh'), 'not-this-boot', 'u', 's', '1',
+            'ERASE-LIUQIN-USERDATA', 'linux_root', 'linux_home']
+    for extra, fragment in (
+            (arguments, b'RAM boot identity changed'),
+            (['ENABLE-USB-RESCUE'] + arguments, b'RAM boot identity changed'),
+            (['NOT-A-STORE'] + arguments[1:], b'unsupported option'),
+            (arguments[:3] + ['nothex'] + arguments[4:], b'invalid ubuntu sha256'),
+            (arguments[:5] + ['ubuntu'] + arguments[6:], b'expected the android image'),
+            (arguments[:8] + ['201326593'], b'does not fit'),
+            (arguments[:2] + ['ftp://x/boot.img'] + arguments[3:], b'not http'),
+            (arguments[:-1], b'usage')):
+        result = subprocess.run(base + extra, capture_output=True)
+        assert result.returncode != 0 and fragment in result.stderr, (extra, result.stderr)
+print('PASS: the switch-store arguments are built for and validated by install-root.sh')
+
+# Serve the bundle plus exactly the one extra file; nothing else outside.
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    bundle = root / 'bundle'
+    bundle.mkdir()
+    (bundle / 'boot.img').write_bytes(b'project')
+    outside = root / 'rom-boot.img'
+    outside.write_bytes(b'android')
+    (root / 'secret').write_bytes(b'secret')
+    server = installer.http.server.ThreadingHTTPServer(
+        ('127.0.0.1', 0), installer.bundle_handler(bundle, {'/android-boot.img': outside}))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    import urllib.request
+    import urllib.error
+    url = f'http://127.0.0.1:{server.server_port}'
+    try:
+        assert urllib.request.urlopen(url + '/boot.img').read() == b'project'
+        assert urllib.request.urlopen(url + '/android-boot.img').read() == b'android'
+        assert urllib.request.urlopen(url + '/android-boot.img?x=1').read() == b'android'
+        for path in ('/../secret', '/%2e%2e/secret', '/rom-boot.img'):
+            try:
+                urllib.request.urlopen(url + path).read()
+            except urllib.error.HTTPError as error:
+                assert error.code == 404, (path, error.code)
+            else:
+                raise AssertionError('served a file outside the bundle: ' + path)
+    finally:
+        server.shutdown()
+        server.server_close()
+print('PASS: the installer serves the Android boot image and nothing else outside the bundle')
+
+# --- one header rule, three implementations --------------------------------
+# liuqin-switch and the store step share the shell text; the installer's
+# Python copy must agree with it on every shape.
+def shell_function(path, name):
+    lines = Path(path).read_text().splitlines()
+    start = lines.index(name + '() { # <image or device>' if name == 'classify' else name + '() { # <file> <offset>')
+    end = lines.index('}', start)
+    return '\n'.join(lines[start:end + 1])
+
+
+switch_script = project / 'device/gnome-overlay/usr/local/sbin/liuqin-switch'
+store_script = project / 'tools/lib/install-switch-store.sh'
+for name in ('u32_at', 'classify'):
+    assert shell_function(switch_script, name) == shell_function(store_script, name), name
+classifier = shell_function(switch_script, 'u32_at') + '\n' + shell_function(switch_script, 'classify') + \
+    '\nclassify "$1"\n'
+shapes = {
+    'ubuntu': boot_header('ubuntu'),
+    'android v4': boot_header('android'),
+    'android v3': boot_header('android', {20: 1580, 40: 3}),
+    'v3 with a v4 header size': boot_header('android', {40: 3}),
+    'v2 without a DTB': boot_header('ubuntu', {1648: 0}),
+    'v2 with a 2048-byte page': boot_header('ubuntu', {36: 2048}),
+    'v2 with a v1 header size': boot_header('ubuntu', {1644: 1648}),
+    'v4 without a kernel': boot_header('android', {8: 0}),
+    'v1': boot_header('ubuntu', {40: 1}),
+    'v5': boot_header('android', {40: 5}),
+    'no magic': b'NOTABOOT' + boot_header('android')[8:],
+    'erased': bytes(4096),
+}
+with tempfile.TemporaryDirectory() as directory:
+    for label, header in shapes.items():
+        image = Path(directory) / 'image'
+        image.write_bytes(header + bytes(4096))
+        want = installer.boot_image_kind(header)
+        for shell in (['sh'], ['busybox', 'sh']):
+            got = subprocess.run([*shell, '-c', classifier, 'sh', str(image)],
+                                 capture_output=True, text=True).stdout.strip()
+            assert got == want, (label, shell, got, want)
+    assert installer.boot_image_kind(shapes['ubuntu']) == 'ubuntu'
+    assert installer.boot_image_kind(shapes['android v3']) == 'android'
+    assert installer.boot_image_kind(shapes['android v4']) == 'android'
+print('PASS: the Python and shell header rules agree on ' + str(len(shapes)) + ' header shapes')

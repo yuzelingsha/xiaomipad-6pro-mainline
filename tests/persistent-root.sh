@@ -1298,7 +1298,8 @@ grep -q '^	storage_marker_sha256=bd86a359f5b6bf05f09abf544967489e924c251ab7c0768
 grep -q '497a8b108a3eefc839c3738a5c452ee3d6a437eb1ebaf0ea43bd635a8a227978' "$init" ||
 	fail "gnome profile-file hash pin changed"
 # The slot marked successful is the slot this boot came from, never a constant:
-# Ubuntu sits in slot A before the dual-boot split and in slot B after it.
+# the dual layout boots Ubuntu from slot A (slot B only on the bootloader's
+# fallback copy), the Linux-only layout from slot B.
 slot_check_lines=$(grep -n '/bin/liuqin-mark-slot-successful --check "\$slot_suffix"' "$init" | cut -d: -f1)
 slot_check_first=$(printf '%s\n' "$slot_check_lines" | sed -n '1p')
 slot_check_second=$(printf '%s\n' "$slot_check_lines" | sed -n '2p')

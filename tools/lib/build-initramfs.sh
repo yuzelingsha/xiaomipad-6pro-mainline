@@ -575,6 +575,7 @@ if [ -n "${INSTALLER_RUNTIME:-}" ]; then
 	mkdir -p "$staging/usr/lib/liuqin"
 	cp "$project_root/tools/lib/install-root.sh" "$staging/usr/lib/liuqin/install-root.sh"
 	cp "$project_root/tools/lib/install-layout.sh" "$staging/usr/lib/liuqin/install-layout.sh"
+	cp "$project_root/tools/lib/install-switch-store.sh" "$staging/usr/lib/liuqin/install-switch-store.sh"
 	cp "$project_root/tools/provision-liuqin-from-persist.sh" "$staging/usr/lib/liuqin/provision.sh"
 	printf 'readonly\n' >"$staging/etc/liuqin-storage-mode"
 	printf 'liuqin\n' >"$staging/etc/liuqin-installer"
