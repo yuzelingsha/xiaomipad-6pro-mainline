@@ -31,6 +31,8 @@
 #define ENTRY_COUNT 96U
 #define ENTRY_SIZE 128U
 #define HEADER_SIZE 92U
+#define ENTRIES_SECTORS ((ENTRY_COUNT * ENTRY_SIZE + SECTOR_SIZE - 1) / SECTOR_SIZE)
+#define FIRST_USABLE 6ULL
 #define BOOT_A_FIRST 75014ULL
 #define BOOT_A_LAST 124165ULL
 #define BOOT_B_FIRST 344107ULL
@@ -130,20 +132,36 @@ struct gpt_copy {
 	uint64_t entries_lba;
 };
 
+/* The entry array location is read from each header and validated rather
+ * than assumed.  The stock Xiaomi ABL writes the backup array at
+ * disk_lbas - 7 (LastUsableLBA = disk_lbas - 8), while a generic GPT tool puts
+ * it at disk_lbas - 5; both are legal.  What must hold is that the primary
+ * array sits between the primary header and FirstUsableLBA, the backup array
+ * between LastUsableLBA and the backup header, and that neither copy overlaps
+ * the usable area or the boot_a/boot_b ranges pinned below.  Writes go to the
+ * entries_lba that each header declares. */
 static int load_gpt_copy(int fd, uint64_t disk_lbas, uint64_t header_lba,
 			 struct gpt_copy *g, int allow_stale_entries_crc)
 {
 	uint32_t saved_header_crc, saved_entries_crc;
+	uint64_t first_usable, last_usable;
 	unsigned char check[SECTOR_SIZE];
 
 	memset(g, 0, sizeof(*g));
 	g->header_lba = header_lba;
+	if (disk_lbas < 2 * (1 + ENTRIES_SECTORS) + FIRST_USABLE ||
+	    (header_lba != 1 && header_lba != disk_lbas - 1))
+		return -1;
 	if (full_pread(fd, g->header, sizeof(g->header), header_lba * SECTOR_SIZE))
 		return -1;
+	first_usable = le64(g->header + 40);
+	last_usable = le64(g->header + 48);
 	if (memcmp(g->header, "EFI PART", 8) || le32(g->header + 12) != HEADER_SIZE ||
 	    le64(g->header + 24) != header_lba ||
 	    le64(g->header + 32) != (header_lba == 1 ? disk_lbas - 1 : 1) ||
-	    le64(g->header + 40) != 6 || le64(g->header + 48) != disk_lbas - 6 ||
+	    first_usable != FIRST_USABLE ||
+	    last_usable < BOOT_B_LAST ||
+	    last_usable + ENTRIES_SECTORS + 1 >= disk_lbas ||
 	    le32(g->header + 80) != ENTRY_COUNT || le32(g->header + 84) != ENTRY_SIZE)
 		return -1;
 	saved_header_crc = le32(g->header + 16);
@@ -152,8 +170,15 @@ static int load_gpt_copy(int fd, uint64_t disk_lbas, uint64_t header_lba,
 	if (crc32_bytes(check, HEADER_SIZE) != saved_header_crc)
 		return -1;
 	g->entries_lba = le64(g->header + 72);
-	if (g->entries_lba != (header_lba == 1 ? 2 : disk_lbas - 5))
-		return -1;
+	if (header_lba == 1) {
+		if (g->entries_lba < 2 ||
+		    g->entries_lba > first_usable - ENTRIES_SECTORS)
+			return -1;
+	} else {
+		if (g->entries_lba <= last_usable ||
+		    g->entries_lba > header_lba - ENTRIES_SECTORS)
+			return -1;
+	}
 	if (full_pread(fd, g->entries, sizeof(g->entries), g->entries_lba * SECTOR_SIZE))
 		return -1;
 	saved_entries_crc = le32(g->header + 88);
@@ -347,7 +372,8 @@ int main(int argc, char **argv)
 	disk_lbas = bytes / SECTOR_SIZE;
 	if (load_gpt_copy(fd, disk_lbas, 1, &primary, 0) ||
 	    load_gpt_copy(fd, disk_lbas, disk_lbas - 1, &backup, 1) ||
-	    memcmp(primary.header + 56, backup.header + 56, 16))
+	    memcmp(primary.header + 56, backup.header + 56, 16) ||
+	    memcmp(primary.header + 40, backup.header + 40, 16))
 		goto out;
 	pt = find_boot(&primary, slot);
 	po = find_boot(&primary, other);

@@ -76,11 +76,19 @@ def gpt_entries(attr_a, attr_b):
     return bytes(entries)
 
 
-def gpt_header(my_lba, alt_lba, entries_lba, entries):
+# Where the backup copy lives.  A generic GPT tool puts the backup entry array
+# right below the backup header (LastUsableLBA = disk_lbas - 6); the stock
+# Xiaomi ABL on liuqin leaves two spare sectors, measured on the device as
+# PartitionEntryLBA = 713721 = disk_lbas - 7 with LastUsableLBA = 713720.
+GENERIC_LAYOUT = dict(backup_entries=DISK_LBAS - 5, last_usable=DISK_LBAS - 6)
+XIAOMI_ABL_LAYOUT = dict(backup_entries=DISK_LBAS - 7, last_usable=DISK_LBAS - 8)
+
+
+def gpt_header(my_lba, alt_lba, entries_lba, entries, last_usable=DISK_LBAS - 6):
     header = bytearray(HEADER_SIZE)
     header[0:8] = b"EFI PART"
     struct.pack_into("<IIII", header, 8, 0x00010000, HEADER_SIZE, 0, 0)
-    struct.pack_into("<QQQQ", header, 24, my_lba, alt_lba, 6, DISK_LBAS - 6)
+    struct.pack_into("<QQQQ", header, 24, my_lba, alt_lba, 6, last_usable)
     header[56:72] = bytes(range(0x40, 0x50))
     struct.pack_into("<QIII", header, 72, entries_lba, ENTRY_COUNT, ENTRY_SIZE,
                      zlib.crc32(entries))
@@ -88,8 +96,12 @@ def gpt_header(my_lba, alt_lba, entries_lba, entries):
     return bytes(header).ljust(SECTOR, b"\0")
 
 
-def make_image(path, attr_a=0x0077, attr_b=0x007A):
+def make_image(path, attr_a=0x0077, attr_b=0x007A, primary_entries=2,
+               backup_entries=DISK_LBAS - 5, last_usable=DISK_LBAS - 6,
+               backup_last_usable=None):
     entries = gpt_entries(attr_a, attr_b)
+    if backup_last_usable is None:
+        backup_last_usable = last_usable
     with open(path, "wb") as image:
         image.truncate(DISK_BYTES)
         mbr = bytearray(SECTOR)
@@ -98,12 +110,18 @@ def make_image(path, attr_a=0x0077, attr_b=0x007A):
         mbr[510:512] = b"\x55\xaa"
         image.seek(0)
         image.write(mbr)
-        image.write(gpt_header(1, DISK_LBAS - 1, 2, entries))
+        # Entries first, headers last: in the deliberately overlapping cases
+        # below the header must win, so the CRCs stay self-consistent and the
+        # only thing wrong with the table is where the array claims to live.
+        image.seek(primary_entries * SECTOR)
         image.write(entries)
-        image.seek((DISK_LBAS - 5) * SECTOR)
+        image.seek(backup_entries * SECTOR)
         image.write(entries)
+        image.seek(1 * SECTOR)
+        image.write(gpt_header(1, DISK_LBAS - 1, primary_entries, entries, last_usable))
         image.seek((DISK_LBAS - 1) * SECTOR)
-        image.write(gpt_header(DISK_LBAS - 1, 1, DISK_LBAS - 5, entries))
+        image.write(gpt_header(DISK_LBAS - 1, 1, backup_entries, entries,
+                               backup_last_usable))
 
 
 def read_copy(path, header_lba):
@@ -136,6 +154,22 @@ def other_entries(path, header_lba):
     _, entries = read_copy(path, header_lba)
     return [entries[i * ENTRY_SIZE:(i + 1) * ENTRY_SIZE]
             for i in range(ENTRY_COUNT) if i not in (13, 42)]
+
+
+def gpt_regions(path):
+    """Every sector a GPT copy can occupy in these tests: LBA 0-5 and the
+    last 16 LBAs."""
+    with open(path, "rb") as image:
+        head = image.read(6 * SECTOR)
+        image.seek((DISK_LBAS - 16) * SECTOR)
+        tail = image.read()
+    return head + tail
+
+
+def sectors_zero(path, first, last):
+    with open(path, "rb") as image:
+        image.seek(first * SECTOR)
+        return image.read((last - first + 1) * SECTOR) == bytes((last - first + 1) * SECTOR)
 
 
 def write_magic(path, magic=b"ANDROID!"):
@@ -367,6 +401,106 @@ def test_mark_tool(binary, tmp):
           f"rc={run.returncode}")
 
 
+def test_entry_locations(binary, tmp):
+    print("liuqin-mark-slot-successful: entry array location")
+    image = tmp / "sde-layout.img"
+    backup = DISK_LBAS - 1
+
+    for label, layout in (("Xiaomi ABL layout (backup entries at disk_lbas-7)",
+                           XIAOMI_ABL_LAYOUT),
+                          ("generic layout (backup entries at disk_lbas-5)",
+                           GENERIC_LAYOUT)):
+        entries_lba = layout["backup_entries"]
+        make_image(image, **layout)
+        before = other_entries(image, 1)
+        run = run_tool(binary, image, "--check", "a")
+        check(f"{label}: --check a passes", run.returncode == 0,
+              f"rc={run.returncode} {run.stderr!r}")
+
+        make_image(image, attr_a=0x0037, **layout)
+        run = run_tool(binary, image, "--mark", "a")
+        check(f"{label}: --mark a succeeds", run.returncode == 0, f"{run.stderr!r}")
+        check(f"{label}: --mark a updated both copies",
+              attrs(image, 1, 13) == 0x0077 and attrs(image, backup, 13) == 0x0077)
+        check(f"{label}: backup header still points at LBA {entries_lba}",
+              struct.unpack_from("<Q", read_copy(image, backup)[0], 72)[0] == entries_lba)
+        check(f"{label}: --mark a left both CRCs valid",
+              crcs_valid(image, 1) and crcs_valid(image, backup))
+        check(f"{label}: --mark a left every other entry byte-identical",
+              other_entries(image, 1) == before and other_entries(image, backup) == before)
+        check(f"{label}: nothing written between the backup array and header",
+              sectors_zero(image, entries_lba + 3, backup - 1))
+        run = run_tool(binary, image, "--check", "a")
+        check(f"{label}: --check a after marking passes", run.returncode == 0)
+
+        make_image(image, **layout)
+        write_magic(image)
+        run = run_tool(binary, image, "--set-active", "a", "--i-know")
+        check(f"{label}: --set-active a succeeds", run.returncode == 0, f"{run.stderr!r}")
+        check(f"{label}: --set-active a wrote 0x3F/0x3A to both copies",
+              attrs(image, 1, 13) == 0x003F and attrs(image, 1, 42) == 0x003A and
+              attrs(image, backup, 13) == 0x003F and attrs(image, backup, 42) == 0x003A)
+        run = run_tool(binary, image, "--set-active", "b", "--i-know")
+        check(f"{label}: --set-active b succeeds", run.returncode == 0, f"{run.stderr!r}")
+        check(f"{label}: --set-active b wrote 0x3F/0x3A to both copies",
+              attrs(image, 1, 42) == 0x003F and attrs(image, 1, 13) == 0x003A and
+              attrs(image, backup, 42) == 0x003F and attrs(image, backup, 13) == 0x003A)
+        check(f"{label}: --set-active left both CRCs valid and the array in place",
+              crcs_valid(image, 1) and crcs_valid(image, backup) and
+              struct.unpack_from("<Q", read_copy(image, backup)[0], 72)[0] == entries_lba and
+              sectors_zero(image, entries_lba + 3, backup - 1))
+
+    # Boundaries that are legal: the primary array ending exactly at
+    # FirstUsableLBA, the backup array starting right after LastUsableLBA and
+    # ending right before the backup header.
+    for label, kwargs in (
+            ("primary entries at LBA 3 (ends at FirstUsableLBA)",
+             dict(primary_entries=3)),
+            ("backup entries right after LastUsableLBA",
+             dict(backup_entries=DISK_LBAS - 9, last_usable=DISK_LBAS - 10)),
+            ("backup entries ending right before the backup header",
+             dict(backup_entries=DISK_LBAS - 4, last_usable=DISK_LBAS - 8))):
+        make_image(image, attr_a=0x0037, **kwargs)
+        run = run_tool(binary, image, "--mark", "a")
+        check(f"accepted: {label}", run.returncode == 0 and
+              attrs(image, 1, 13) == 0x0077 and attrs(image, backup, 13) == 0x0077 and
+              crcs_valid(image, 1) and crcs_valid(image, backup), f"{run.stderr!r}")
+
+    # Locations that overlap the usable area or a header, plus geometry the
+    # two headers disagree on.  Every one must be refused for --check, --mark
+    # and --set-active, and leave every GPT sector untouched.  Slot A is
+    # already successful and boot_a carries ANDROID!, so on an accepted table
+    # every one of the four calls below would succeed.
+    for label, kwargs in (
+            ("primary entries at LBA 4 (overlap FirstUsableLBA)",
+             dict(primary_entries=4)),
+            ("primary entries at LBA 6 (inside the usable area)",
+             dict(primary_entries=6)),
+            ("backup entries at LastUsableLBA",
+             dict(backup_entries=DISK_LBAS - 8, last_usable=DISK_LBAS - 8)),
+            ("backup entries at disk_lbas-7 below LastUsableLBA disk_lbas-6",
+             dict(backup_entries=DISK_LBAS - 7, last_usable=DISK_LBAS - 6)),
+            ("backup entries overlapping the backup header",
+             dict(backup_entries=DISK_LBAS - 3, last_usable=DISK_LBAS - 8)),
+            ("backup entries at the backup header LBA",
+             dict(backup_entries=DISK_LBAS - 1, last_usable=DISK_LBAS - 8)),
+            ("LastUsableLBA below the pinned boot_b range",
+             dict(backup_entries=DISK_LBAS - 7, last_usable=BOOT_B[1] - 1)),
+            ("primary/backup LastUsableLBA disagree",
+             dict(backup_entries=DISK_LBAS - 7, last_usable=DISK_LBAS - 6,
+                  backup_last_usable=DISK_LBAS - 8))):
+        make_image(image, **kwargs)
+        write_magic(image)
+        snapshot = gpt_regions(image)
+        results = [run_tool(binary, image, *args).returncode for args in
+                   (("--check", "a"), ("--mark", "a"),
+                    ("--set-active", "a", "--i-know"),
+                    ("--set-active", "b", "--i-know"))]
+        check(f"rejected: {label}",
+              results == [1, 1, 1, 1] and gpt_regions(image) == snapshot,
+              f"rc={results}")
+
+
 def main():
     # The initramfs runs under BusyBox ash and the device script under dash;
     # prefer BusyBox so the parser is exercised by its real interpreter.
@@ -384,6 +518,7 @@ def main():
         test_init_parser(shell)
         test_boot_android_parser(shell, tmp)
         test_mark_tool(str(binary), tmp)
+        test_entry_locations(str(binary), tmp)
     if FAILURES:
         print(f"liuqin slot-tool tests: FAIL ({len(FAILURES)})")
         return 1
