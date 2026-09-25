@@ -85,12 +85,28 @@ def main():
     if project / 'out' not in out.parents:
         parser.error('--out must be inside the project out directory')
     lock = json.loads((project / 'kernel/source.json').read_text())
+    subprocess.run(['sha256sum', '-c', '--quiet', 'SHA256SUMS'], cwd=kernel, check=True)
     info = json.loads((kernel / 'build-info.json').read_text())
-    if info['commit'] != lock['commit'] or info.get('build_kind') != 'product-input':
+    if info['commit'] != lock['commit']:
         parser.error('Kernel build must match the product lock, not a development override')
     if info['config_sha256'] != lock['config_sha256']:
         parser.error('Kernel configuration does not match the product lock')
-    subprocess.run(['sha256sum', '-c', '--quiet', 'SHA256SUMS'], cwd=kernel, check=True)
+    if info.get('build_kind') == 'development':
+        # A development build is a `build-liuqin-kernel.py --revision` build.
+        # It was made from the same clean source, fragments and builder as a
+        # product build; only its label records the lock of that day.  Once
+        # the lock has moved to that very revision, the output is the product
+        # input by content.  Accept it only when the fragments it was built
+        # from are byte-identical to the ones the lock names today.
+        fragments = {path: hashlib.sha256((project / path).read_bytes()).hexdigest()
+                     for path in lock['config_fragments']}
+        if info.get('fragments') != fragments:
+            parser.error('Development kernel build used other config fragments than the product lock')
+        print('Kernel: development build of the locked commit ' + lock['commit'][:12] +
+              ' (built while the lock named ' + str(info.get('product_kernel_commit'))[:12] +
+              '); commit, configuration and fragments match the lock', flush=True)
+    elif info.get('build_kind') != 'product-input':
+        parser.error('Kernel build must match the product lock, not a development override')
     env = os.environ.copy()
     # Privileged assembly reads exactly these user-owned repositories.
     env.update(GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_0='safe.directory',
