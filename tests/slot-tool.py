@@ -4,9 +4,9 @@
 Two things are covered:
 
   * the cmdline slot parser, both copies of it -- the ``slot_from_cmdline``
-    function in ``initramfs/init`` and the inline copy in
-    ``device/gnome-overlay/usr/local/bin/liuqin-boot-android`` -- against a
-    table of accepted and rejected command lines;
+    function in ``initramfs/init`` and the one in
+    ``device/gnome-overlay/usr/local/sbin/liuqin-switch`` -- against a table
+    of accepted and rejected command lines;
 
   * ``device/boot/liuqin-mark-slot-successful`` against a synthetic image the
     size of the device's ``sde`` LUN, whose GPT carries ``boot_a``/``boot_b``
@@ -219,9 +219,9 @@ def extract_function(path, name):
     raise SystemExit(f"slot-tool: {name}() is unterminated in {path}")
 
 
-def test_init_parser(shell):
-    print("initramfs/init slot_from_cmdline")
-    body = extract_function(PROJECT / "initramfs/init", "slot_from_cmdline")
+def test_parser(shell, path, label):
+    print(f"{label} slot_from_cmdline")
+    body = extract_function(path, "slot_from_cmdline")
     for cmdline, expected in CMDLINE_CASES:
         script = body + '\nif slot_from_cmdline "$1"; then printf "ok:%s\\n" "$slot_suffix"; else printf "no:%s\\n" "$slot_suffix"; fi\n'
         out = subprocess.run([*shell, "-c", script, "sh", cmdline],
@@ -230,49 +230,13 @@ def test_init_parser(shell):
         check(f"{cmdline!r} -> {want}", out == want, f"got {out!r}")
 
 
-def test_boot_android_parser(shell, tmp):
-    print("liuqin-boot-android slot gate")
-    script = PROJECT / "device/gnome-overlay/usr/local/bin/liuqin-boot-android"
-    fake = tmp / "fakebin"
-    fake.mkdir(exist_ok=True)
-    (fake / "id").write_text("#!/bin/sh\nprintf '0\\n'\n")
-    (fake / "id").chmod(0o755)
-    mark = fake / "mark"
-    mark.write_text("#!/bin/sh\nprintf 'mark %s\\n' \"$*\"\n")
-    mark.chmod(0o755)
-    cmdline_file = tmp / "cmdline"
-
-    def invoke(cmdline, uid="0"):
-        cmdline_file.write_text(cmdline + "\n")
-        (fake / "id").write_text(f"#!/bin/sh\nprintf '{uid}\\n'\n")
-        (fake / "id").chmod(0o755)
-        env = dict(os.environ,
-                   LIUQIN_ID=str(fake / "id"), LIUQIN_MARK_SLOT=str(mark),
-                   LIUQIN_CMDLINE=str(cmdline_file), LIUQIN_BOOT_A=str(tmp / "absent"),
-                   LIUQIN_SYSTEMCTL="/bin/true", LIUQIN_DD="/bin/true")
-        return subprocess.run([*shell, str(script), "--dry-run"],
-                              capture_output=True, text=True, env=env)
-
-    run = invoke("androidboot.slot_suffix=_b", uid="1000")
-    check("non-root is refused", run.returncode == 1 and "must run as root" in run.stderr,
-          f"rc={run.returncode} {run.stderr!r}")
-    run = invoke("androidboot.slot_suffix=_a")
-    check("slot a is refused", run.returncode == 1 and "nothing to switch" in run.stderr,
-          f"rc={run.returncode} {run.stderr!r}")
-    run = invoke("console=ttyMSM0")
-    check("missing suffix is refused", run.returncode == 1 and "no usable" in run.stderr,
-          f"rc={run.returncode} {run.stderr!r}")
-    run = invoke("androidboot.slot_suffix=_c")
-    check("garbage suffix is refused", run.returncode == 1 and "no usable" in run.stderr,
-          f"rc={run.returncode} {run.stderr!r}")
-    run = invoke("androidboot.slot_suffix=_b")
-    check("slot b reaches the boot_a check",
-          run.returncode == 1 and "not a block device" in run.stderr,
-          f"rc={run.returncode} {run.stderr!r}")
-    run = invoke("androidboot.slot_suffix=_b slot_suffix=_a")
-    check("disagreeing suffixes are refused",
-          run.returncode == 1 and "no usable" in run.stderr,
-          f"rc={run.returncode} {run.stderr!r}")
+def test_parser_copies_agree():
+    # The switcher only uses its copy to refuse a switch on the fallback slot,
+    # but the two must not drift apart silently.
+    init = extract_function(PROJECT / "initramfs/init", "slot_from_cmdline")
+    switch = extract_function(PROJECT / "device/gnome-overlay/usr/local/sbin/liuqin-switch",
+                              "slot_from_cmdline")
+    check("the initramfs and switcher parsers are the same text", init == switch)
 
 
 # --------------------------------------------------------------------------
@@ -515,8 +479,10 @@ def main():
         subprocess.run([compiler, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
                         str(PROJECT / "device/boot/liuqin-mark-slot-successful.c"),
                         "-o", str(binary)], check=True)
-        test_init_parser(shell)
-        test_boot_android_parser(shell, tmp)
+        test_parser(shell, PROJECT / "initramfs/init", "initramfs/init")
+        test_parser(shell, PROJECT / "device/gnome-overlay/usr/local/sbin/liuqin-switch",
+                    "liuqin-switch")
+        test_parser_copies_agree()
         test_mark_tool(str(binary), tmp)
         test_entry_locations(str(binary), tmp)
     if FAILURES:
