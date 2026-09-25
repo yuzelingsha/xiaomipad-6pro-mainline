@@ -10,7 +10,11 @@ Both repositories must exist under the same GitHub owner before enabling this fl
 The integration repository's `Kernel build` workflow uses `kernel/source.json`.
 Accept a kernel update by changing that commit: the configuration and packaging
 remain in the integration repository. Kernel development artifacts record their
-tested SHA separately and cannot enter image assembly as product inputs.
+tested SHA separately and cannot enter image assembly as product inputs. The one
+exception is a development build of the very commit that `kernel/source.json`
+pins now, with the pinned configuration hash and byte-identical fragments: it was
+built from the same inputs as a product build, and image assembly accepts it
+and says so.
 
 Kernel jobs use GitHub-hosted Ubuntu runners and ccache. They upload the Image,
 DTB, configuration, symbols, matching module package inputs and checksums as
