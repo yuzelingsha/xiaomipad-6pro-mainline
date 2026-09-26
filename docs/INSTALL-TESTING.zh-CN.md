@@ -231,17 +231,24 @@ Ubuntu 镜像；头版本 3 或 4（头部分别为 1580 或 1584 字节）的�
 sudo liuqin-switch import-android /path/to/boot-ksu.img
 ```
 
-若切换已被拒绝，可在 Android 中把 `boot_a` 复制出平板，在主机上用
-`fastboot flash boot_a <本项目 boot.img>` 恢复 Ubuntu 的 boot 镜像，再从 Ubuntu 导入该副本。
+若切换已被拒绝，可在 Android 中把 `boot_a` 复制出平板，在主机上按下文的 Fastboot 命令
+恢复 Ubuntu 的 boot 镜像，再从 Ubuntu 导入该副本。
 
 **平板从 B 槽启动时。** `boot_a` 无法加载时，Bootloader 会自行切换到 B 槽，从回退副本启动 Ubuntu。
 切换工具会识别这种情况并拒绝写入，因为写入 `boot_a` 无法改变下次启动的内容。
 请在 Fastboot 模式下从主机修复：
 
 ```sh
-fastboot flash boot_a /path/to/boot.img
+cp /path/to/boot.img boot-padded.img
+truncate -s 201326592 boot-padded.img
+fastboot flash boot_a boot-padded.img
 fastboot --set-active=a
 ```
+
+Fastboot 只写入发送的字节，而 `liuqin-switch` 按整个分区识别 `boot_a` 的内容，因此与安装器一样，
+镜像需零填充到 192 MiB 分区大小后再刷写。直接刷写原始镜像同样可以启动，但分区尾部会保留原有内容，
+此时 `liuqin-switch verify` 会报告“不是存储区中的 Ubuntu 镜像”，直到 `liuqin-switch to-ubuntu`
+重写整个分区。
 
 切换工具无法拦截的写入中断（例如断电）会导致相同的结果，修复方法相同。
 

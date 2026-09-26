@@ -4,6 +4,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -57,7 +58,11 @@ with tempfile.TemporaryDirectory() as directory:
     class StopFlow(Exception):
         """Not an OSError/RuntimeError, so the RAM-channel retry loop lets it through."""
 
-    def run_install(argv_extra, reported, stdin_tty=False, answer=None):
+    pinned_boot_bytes = json.loads((project / 'tools/lib/liuqin-rom-images.json').read_text()
+                                   )['images']['boot.img']['bytes']
+
+    def run_install(argv_extra, reported, stdin_tty=False, answer=None, boot_size=hex(pinned_boot_bytes),
+                    max_download='0x30000000'):
         calls = []
 
         def fastboot(command, **kwargs):
@@ -67,8 +72,8 @@ with tempfile.TemporaryDirectory() as directory:
                 return SimpleNamespace(stdout='booting\n')
             name = command[-1]
             values = {'product': 'liuqin', 'unlocked': 'yes', 'current-slot': 'a',
-                      'partition-size:userdata': reported, 'partition-size:boot_a': '0x10000000',
-                      'partition-size:boot_b': '0x10000000'}
+                      'partition-size:userdata': reported, 'partition-size:boot_a': boot_size,
+                      'partition-size:boot_b': boot_size, 'max-download-size': max_download}
             return SimpleNamespace(stdout=name + ': ' + values[name] + '\n')
 
         stdin = SimpleNamespace(isatty=lambda: stdin_tty)
@@ -116,6 +121,18 @@ with tempfile.TemporaryDirectory() as directory:
     calls = run_install(['--yes'], hex(16 * 1024**3))
     assert ['partition-size:boot_b'] == [c[-1] for c in calls if c[-1].startswith('partition-size:boot')], calls
     print('PASS: the Linux-only layout checks boot_b only')
+
+    # The project image is flashed zero-filled to the whole partition, so a
+    # boot partition of another size, or a bootloader that cannot take the
+    # whole partition in one raw download, stops before the RAM installer.
+    for boot_size, max_download in ((hex(pinned_boot_bytes + 4096), '0x30000000'),
+                                    (hex(pinned_boot_bytes - 4096), '0x30000000'),
+                                    (hex(pinned_boot_bytes), hex(pinned_boot_bytes - 1))):
+        calls = run_install(['--yes'], hex(16 * 1024**3), boot_size=boot_size, max_download=max_download)
+        assert not any(call[3:4] == ['boot'] for call in calls), (boot_size, max_download, calls)
+    calls = run_install(['--yes'], hex(16 * 1024**3), max_download=str(pinned_boot_bytes))
+    assert calls[-1][3] == 'boot', calls
+    print('PASS: boot partitions must be the pinned size and fit one fastboot download')
 
 # A local fake shell supplies a CRLF transcript containing the echoed command.
 # Only complete marker lines may finish the transaction, not the echo itself.
@@ -262,21 +279,65 @@ print('PASS: the staged partition-table halves land in the scratch directory the
 # fastboot itself.  The stock boot.img is never flashed there -- it is stored.
 assert installer.boot_slots('dual') == ('a', 'b')
 assert installer.boot_slots('linux-only') == ('b',)
-for mode, expected in (
-        ('dual', [['flash', 'vendor_boot_a', '/rom/vendor_boot.img'],
-                  ['flash', 'boot_a', '/bundle/boot.img'],
-                  ['flash', 'boot_b', '/bundle/boot.img'],
-                  ['--set-active=a'], ['reboot']]),
-        ('linux-only', [['flash', 'boot_b', '/bundle/boot.img'],
-                        ['--set-active=b'], ['reboot']])):
+boot_bytes = installer.boot_partition_bytes(pinned)
+assert boot_bytes == 201326592 == pinned['images']['boot.img']['bytes']
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    image = root / 'boot.img'
+    image.write_bytes(boot_header('ubuntu') + b'\x5a' * 8192)
+    padded, padded_sha = installer.pad_boot_image(image, installer.sha(image), boot_bytes, root)
+    for mode, expected in (
+            ('dual', [['flash', 'vendor_boot_a', '/rom/vendor_boot.img'],
+                      ['flash', 'boot_a', str(padded)],
+                      ['flash', 'boot_b', str(padded)],
+                      ['--set-active=a'], ['reboot']]),
+            ('linux-only', [['flash', 'boot_b', str(padded)],
+                            ['--set-active=b'], ['reboot']])):
+        sent = []
+        payloads = {}
+
+        def record(*arguments):
+            sent.append(list(arguments))
+            if arguments[0] == 'flash' and arguments[1].startswith('boot_'):
+                payload = Path(arguments[2])
+                payloads[arguments[1]] = (payload.stat().st_size, installer.sha(payload))
+
+        flashes = [('vendor_boot.img', {'partition': 'vendor_boot_a', 'path': '/rom/vendor_boot.img'})] \
+            if mode == 'dual' else []
+        installer.finish_in_fastboot(record, mode, flashes, padded, padded_sha, boot_bytes)
+        assert sent == expected, (mode, sent)
+        assert not any(call[0].startswith('--set-active') and call != expected[-2] for call in sent), sent
+        # Every boot write is the whole partition: the image, then zeros.
+        assert set(payloads) == {'boot_' + slot for slot in installer.boot_slots(mode)}, payloads
+        assert all(payload == (boot_bytes, padded_sha) for payload in payloads.values()), payloads
+    assert padded.read_bytes()[:image.stat().st_size] == image.read_bytes()
+    assert padded.read_bytes()[image.stat().st_size:] == bytes(boot_bytes - image.stat().st_size)
+    # A padded file that changed after it was built is never flashed.
+    with padded.open('r+b') as stream:
+        stream.seek(boot_bytes - 1)
+        stream.write(b'\x01')
     sent = []
-    flashes = [('vendor_boot.img', {'partition': 'vendor_boot_a', 'path': '/rom/vendor_boot.img'})] \
-        if mode == 'dual' else []
-    installer.finish_in_fastboot(lambda *a: sent.append(list(a)), mode, flashes, Path('/bundle/boot.img'))
-    assert sent == expected, (mode, sent)
-    assert not any(call[0].startswith('--set-active') and call != expected[-2] for call in sent), sent
+    try:
+        installer.finish_in_fastboot(lambda *a: sent.append(a), 'dual', [], padded, padded_sha, boot_bytes)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('a changed padded image was flashed')
+    assert sent == [], sent
+    # The source is checked against the bundle digest while it is copied, and
+    # an image larger than the partition is refused.
+    for source, digest, fragment in ((image, 'f' * 64, 'changed while it was being padded'),
+                                     (image, installer.sha(image), 'larger than')):
+        with tempfile.TemporaryDirectory() as scratch:
+            try:
+                installer.pad_boot_image(source, digest, boot_bytes if fragment != 'larger than' else 4096,
+                                         scratch)
+            except RuntimeError as error:
+                assert fragment in str(error), error
+            else:
+                raise AssertionError('pad_boot_image accepted ' + fragment)
 print('PASS: dual writes the project image to boot_a and boot_b and selects slot A; '
-      'linux-only keeps slot B')
+      'linux-only keeps slot B; every boot write is the image zero-filled to the whole partition')
 
 installer_source = (project / 'tools/install-liuqin.py').read_text()
 assert "'--set-active=b'" not in installer_source and '--set-active=b' not in installer_source
@@ -311,6 +372,93 @@ with tempfile.TemporaryDirectory() as directory:
         result = subprocess.run(base + extra, capture_output=True)
         assert result.returncode != 0 and fragment in result.stderr, (extra, result.stderr)
 print('PASS: the switch-store arguments are built for and validated by install-root.sh')
+
+# What the tablet holds after the dual installation, as liuqin-switch sees it.
+# boot_a starts out as the stock Android image, whose AVB footer sits at the
+# end of the partition; fastboot writes exactly the bytes it is sent.  The
+# store's SHA256SUMS names the unpadded image (the installer passes the bundle
+# digest to install-switch-store.sh), while liuqin-switch expects boot_a to
+# hash like that image zero-filled to the partition size -- which is what the
+# installer now flashes.  The bare image, as flashed before, fails `verify`.
+switch_script = project / 'device/gnome-overlay/usr/local/sbin/liuqin-switch'
+
+
+def switch_function(name):
+    lines = switch_script.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(name + '() {'))
+    return '\n'.join(lines[start:lines.index('}', start) + 1])
+
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    ubuntu = root / 'boot.img'
+    ubuntu.write_bytes(boot_header('ubuntu') + b'\x5a' * (3 * 1024 * 1024 + 123))
+    android = root / 'android.img'
+    stock = bytearray(boot_header('android') + b'\xa5' * 8192)
+    android.write_bytes(bytes(stock))
+    padded, padded_sha = installer.pad_boot_image(ubuntu, installer.sha(ubuntu), boot_bytes, root)
+    unpadded_sha = installer.sha(ubuntu)
+    arguments = installer.switch_store_arguments('http://192.168.7.1:8000', unpadded_sha, ubuntu,
+                                                 {'sha256': installer.sha(android), 'path': android})
+    assert arguments[3] == unpadded_sha != padded_sha
+    # liuqin-switch's own padded_sha() of the store image is the flashed payload's digest.
+    shell = '\n'.join((switch_function('zeros'), switch_function('padded_sha'), 'padded_sha "$1"'))
+    switch_padded = subprocess.run(['sh', '-c', 'BOOT_BYTES=' + str(boot_bytes) + '\n' + shell, 'sh', str(ubuntu)],
+                                   capture_output=True, text=True, check=True).stdout.strip()
+    assert switch_padded == padded_sha == installer.sha(padded), (switch_padded, padded_sha)
+
+    def fixture(flashed, name):
+        base = root / name
+        dev, store = base / 'dev', base / 'store'
+        dev.mkdir(parents=True)
+        for kind, source, digest in (('ubuntu', ubuntu, arguments[3]), ('android', android, arguments[7])):
+            (store / kind).mkdir(parents=True)
+            (store / kind / 'boot.img').write_bytes(source.read_bytes())
+            # install-switch-store.sh writes exactly this line from its argument.
+            (store / kind / 'SHA256SUMS').write_text(digest + '  boot.img\n')
+        # The stock image fills boot_a and ends in its AVB footer.
+        with (dev / 'boot_a').open('wb') as stream:
+            stream.write(bytes(stock))
+            stream.truncate(boot_bytes)
+            stream.seek(boot_bytes - 64)
+            stream.write(b'AVBf' + b'\x01' * 60)
+        # fastboot flash boot_a: the payload's bytes, nothing more.
+        with (dev / 'boot_a').open('r+b') as stream, flashed.open('rb') as payload:
+            while chunk := payload.read(1 << 20):
+                stream.write(chunk)
+        with (dev / 'sde').open('wb') as stream:
+            stream.truncate(2923429888)
+        (dev / 'boot_a.ro').write_text('1\n')
+        (dev / 'sde.ro').write_text('1\n')
+        (dev / 'cmdline').write_text('console=ttyMSM0 androidboot.slot_suffix=_a\n')
+        if as_root is None:
+            return None
+        return subprocess.run([*as_root, 'sh', str(switch_script), 'verify',
+                               '--dev-dir', str(dev), '--store', str(store)],
+                              capture_output=True, text=True)
+
+    # liuqin-switch insists on uid 0 even against a file fixture.  CI runners
+    # may forbid unprivileged user namespaces; the digest identity above is
+    # the fix itself and is checked either way.
+    if os.geteuid() == 0:
+        as_root = []
+    elif subprocess.run(['unshare', '-r', 'true'], capture_output=True).returncode == 0:
+        as_root = ['unshare', '-r']
+    else:
+        as_root = None
+    good = fixture(padded, 'padded')
+    assert installer.sha(root / 'padded/dev/boot_a') == padded_sha
+    if as_root is None:
+        print('SKIP: liuqin-switch verify on the flashed fixture (no uid 0 or user namespace here)')
+    else:
+        assert good.returncode == 0 and 'boot_a holds: the Ubuntu image from the store' in \
+            good.stdout + good.stderr, good.stdout + good.stderr
+        stale = fixture(ubuntu, 'bare')
+        assert stale.returncode != 0 and 'boot_a holds: an Ubuntu image that is not the one in the store' in \
+            stale.stdout + stale.stderr, stale.stdout + stale.stderr
+print('PASS: the flashed payload is the whole partition; SHA256SUMS keeps the unpadded digest, which '
+      'liuqin-switch pads to the flashed digest' + ('' if as_root is None else
+      '; liuqin-switch verify accepts boot_a after the flash (the bare image, as before, is refused)'))
 
 # Serve the bundle plus exactly the one extra file; nothing else outside.
 with tempfile.TemporaryDirectory() as directory:
@@ -353,7 +501,6 @@ def shell_function(path, name):
     return '\n'.join(lines[start:end + 1])
 
 
-switch_script = project / 'device/gnome-overlay/usr/local/sbin/liuqin-switch'
 store_script = project / 'tools/lib/install-switch-store.sh'
 for name in ('u32_at', 'classify'):
     assert shell_function(switch_script, name) == shell_function(store_script, name), name

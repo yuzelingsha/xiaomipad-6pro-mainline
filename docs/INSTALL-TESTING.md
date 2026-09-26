@@ -298,8 +298,8 @@ sudo liuqin-switch import-android /path/to/boot-ksu.img
 ```
 
 If the switch is already blocked, copy `boot_a` off the tablet from Android,
-restore Ubuntu's boot image from a host with
-`fastboot flash boot_a <project boot.img>`, and import the copy from Ubuntu.
+restore Ubuntu's boot image from a host (see the Fastboot commands below), and
+import the copy from Ubuntu.
 
 **When the tablet starts from slot B.** If `boot_a` does not load, the
 bootloader switches to slot B by itself and starts Ubuntu from the fallback
@@ -307,9 +307,18 @@ copy. The switcher detects this and refuses to write, because writing `boot_a`
 cannot change what boots next. Repair it from a host in Fastboot mode:
 
 ```sh
-fastboot flash boot_a /path/to/boot.img
+cp /path/to/boot.img boot-padded.img
+truncate -s 201326592 boot-padded.img
+fastboot flash boot_a boot-padded.img
 fastboot --set-active=a
 ```
+
+Fastboot writes only the bytes it is sent, and `liuqin-switch` identifies the
+content of `boot_a` by the whole partition, so the image is flashed zero-filled
+to the 192 MiB partition size, as the installer does. The bare image boots as
+well, but leaves the previous tail of the partition behind it, and
+`liuqin-switch verify` then reports an Ubuntu image that is not the one in the
+store until `liuqin-switch to-ubuntu` rewrites the partition.
 
 An interruption during a write that the switcher cannot catch, such as a power
 loss, has the same outcome and the same repair.

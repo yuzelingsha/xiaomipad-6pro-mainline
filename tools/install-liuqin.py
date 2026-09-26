@@ -14,6 +14,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -64,14 +65,63 @@ def sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def zero_digest(length):
-    """sha256 of `length` zero bytes, for the padding check on stock images."""
-    digest = hashlib.sha256()
+def update_zeros(digest, length):
+    """Feed `length` zero bytes into `digest`."""
     while length > 0:
         block = min(length, 1 << 20)
         digest.update(bytes(block))
         length -= block
-    return digest.hexdigest()
+    return digest
+
+
+def zero_digest(length):
+    """sha256 of `length` zero bytes, for the padding check on stock images."""
+    return update_zeros(hashlib.sha256(), length).hexdigest()
+
+
+def boot_partition_bytes(table):
+    """The size of boot_a and boot_b.
+
+    The stock boot.img of the pinned ROM fills its partition exactly (the
+    --android-boot override is held to the same length), so the pinned table
+    is the one source of this number; the partitions the bootloader reports
+    are compared with it before anything is written.
+    """
+    return table['images'][ANDROID_BOOT_IMAGE]['bytes']
+
+
+def pad_boot_image(source, expected_sha256, size, directory):
+    """Write `source` followed by zeros up to `size` bytes into `directory`.
+
+    The bootloader writes only the bytes it is sent, so flashing the bare
+    project image would leave the old tail of the partition (the stock
+    image's AVB footer, for one) behind it.  liuqin-switch identifies boot_a
+    by the hash of the whole partition, the image zero-filled to the
+    partition size, so that is exactly what is flashed.  The zeros are a
+    sparse tail (truncate), so the file costs the image's own size on disk.
+
+    Returns the padded file and its sha256.  The source is checked against
+    `expected_sha256` while it is copied, so the padded file carries no bytes
+    other than those of the verified bundle image.
+    """
+    target = Path(directory) / 'boot-padded.img'
+    image = hashlib.sha256()
+    padded = hashlib.sha256()
+    with source.open('rb') as stream, target.open('xb') as out:
+        while chunk := stream.read(1 << 20):
+            image.update(chunk)
+            padded.update(chunk)
+            out.write(chunk)
+        length = out.tell()
+        if length > size:
+            raise RuntimeError(f'the boot image is {length} bytes, larger than the {size}-byte boot partition')
+        out.truncate(size)
+    if image.hexdigest() != expected_sha256:
+        raise RuntimeError('the boot image changed while it was being padded; nothing was written')
+    update_zeros(padded, size - length)
+    if target.stat().st_size != size:
+        raise RuntimeError(f'the padded boot image is not {size} bytes')
+    return target, padded.hexdigest()
 
 
 def command(address, text, timeout=60):
@@ -348,11 +398,26 @@ def main(argv=None):
         if userdata_size is not None and userdata_size < 16 * 1024 ** 3:
             parser.error('userdata is smaller than 16 GiB; only Xiaomi Pad 6 Pro (liuqin) is supported'
                          ' —— 请确认设备为小米平板 6 Pro（liuqin），不要用于其他机型')
-        # The project boot image must fit every boot partition it is written to.
+        # The project boot image is flashed zero-filled to the whole boot
+        # partition, so every partition it goes to must be the pinned size,
+        # the image must fit it, and the padded image must go over USB in one
+        # raw download rather than be re-sparsed by fastboot.
+        boot_bytes = boot_partition_bytes(load_rom_table(parser))
+        for slot in boot_slots(args.layout):
+            reported = partition_size('boot_' + slot)
+            if reported != boot_bytes:
+                parser.error(f'boot_{slot} is {reported} bytes, not the {boot_bytes} bytes of the pinned'
+                             ' layout —— boot 分区大小与本项目验证过的设备不一致')
         largest = max((bundle / name).stat().st_size for name in ('boot.img', 'installer.img'))
-        if any(largest > partition_size('boot_' + slot) for slot in boot_slots(args.layout)):
+        if largest > boot_bytes:
             parser.error('boot image exceeds the reported boot partition size'
                          ' —— boot 镜像大于 boot 分区，包与设备不匹配')
+        match = re.search(r'max-download-size:\s*(0x[0-9a-fA-F]+|[0-9]+)',
+                          fastboot('getvar', 'max-download-size'))
+        if not match or int(match[1], 0) < boot_bytes:
+            parser.error('the bootloader cannot receive a whole boot partition in one download'
+                         ' (max-download-size ' + (match[1] if match else 'unknown') + ')'
+                         ' —— Bootloader 单次下载上限小于 boot 分区')
         print('Layout: ' + args.layout)
         if args.keep_home:
             print('Reinstalling on the existing split layout: the partition sizes are kept as'
@@ -379,7 +444,18 @@ def main(argv=None):
             if input('Type YES to continue / 输入 YES 继续: ') != 'YES':
                 parser.error('data erasure was not confirmed —— 未确认，已取消')
     server = None
+    scratch = None
     try:
+        if restore is None:
+            # Built before anything on the tablet changes, so that a host
+            # without room for it stops the installation while it is harmless.
+            # Host-side scratch, private to this run; the bundle directory is
+            # served to the tablet and may be read-only.
+            scratch = tempfile.TemporaryDirectory(prefix='liuqin-install-')
+            padded_boot = pad_boot_image(bundle / 'boot.img', manifest['files']['boot.img'],
+                                         boot_bytes, scratch.name)
+            print(f'Project boot image zero-filled to the {boot_bytes}-byte boot partition:'
+                  f' sha256 {padded_boot[1]}', flush=True)
         print('Booting the RAM installer...', flush=True)
         fastboot('boot', str(bundle / 'installer.img'))
         deadline = time.monotonic() + 120
@@ -493,12 +569,14 @@ def main(argv=None):
             time.sleep(2)
         else:
             raise RuntimeError('Return to Fastboot not observed; boot partition was not flashed')
-        finish_in_fastboot(fastboot, args.layout, flashes, bundle / 'boot.img')
+        finish_in_fastboot(fastboot, args.layout, flashes, *padded_boot, boot_bytes)
         print('Installation commands completed. First-boot verification is still required.')
     finally:
         if server:
             server.shutdown()
             server.server_close()
+        if scratch:
+            scratch.cleanup()
 
 
 def boot_slots(mode):
@@ -509,14 +587,18 @@ def boot_slots(mode):
     return (LINUX_ONLY_UBUNTU_SLOT,)
 
 
-def finish_in_fastboot(fastboot, mode, flashes, boot_image):
+def finish_in_fastboot(fastboot, mode, flashes, padded_image, padded_sha256, partition_bytes):
     """The fastboot tail of an installation, after the root is in place.
 
     Stock images go to their _a partitions first, then the project boot image
-    to every slot boot_slots() names, and only then is the booting slot
-    selected -- through the bootloader's own --set-active, the one operation
-    that keeps its slot attributes, type GUIDs and boot LUN consistent.
+    -- zero-filled to the whole partition by pad_boot_image(), and checked
+    again here -- to every slot boot_slots() names, and only then is the
+    booting slot selected -- through the bootloader's own --set-active, the
+    one operation that keeps its slot attributes, type GUIDs and boot LUN
+    consistent.
     """
+    if padded_image.stat().st_size != partition_bytes or sha(padded_image) != padded_sha256:
+        raise RuntimeError('the zero-filled boot image changed before it was flashed; boot_a was not written')
     for name, entry in flashes:
         source = 'supplied' if entry.get('override') else 'stock'
         print(f'Writing the {source} {name} to {entry["partition"]}...', flush=True)
@@ -524,8 +606,8 @@ def finish_in_fastboot(fastboot, mode, flashes, boot_image):
     slots = boot_slots(mode)
     for slot in slots:
         role = 'fallback copy of the ' if slot != slots[0] else ''
-        print(f'Writing the {role}project boot image to boot_{slot}...', flush=True)
-        fastboot('flash', 'boot_' + slot, str(boot_image))
+        print(f'Writing the {role}project boot image to boot_{slot} (whole partition)...', flush=True)
+        fastboot('flash', 'boot_' + slot, str(padded_image))
     fastboot('--set-active=' + slots[0])
     fastboot('reboot')
 
