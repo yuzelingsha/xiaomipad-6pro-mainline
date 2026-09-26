@@ -53,10 +53,12 @@ complete without them is not established.
 
 The image also installs `gnome-snapshot`, `libcamera-ipa`,
 `gstreamer1.0-libcamera`, `gstreamer1.0-plugins-bad` (`h264parse`),
-`gstreamer1.0-plugins-ugly` (the H.264 encoder used for recording) and
-`gstreamer1.0-libav` (the H.264 decoder used for playback). They are image
-content, not dependencies of `liuqin-device-support`, so they can be removed
-without affecting the device support.
+`gstreamer1.0-plugins-ugly` (the H.264 encoder used for recording),
+`gstreamer1.0-libav` (the H.264 decoder used for playback), and the diagnostic
+tools `libcamera-tools` (`cam`) and `v4l-utils` (`media-ctl`, `v4l2-ctl`) used
+in [Verifying](#verifying). They are image content, not dependencies of
+`liuqin-device-support`, so they can be removed without affecting the device
+support.
 
 ## DMA-BUF import in Snapshot
 
@@ -96,7 +98,7 @@ sudo cat /sys/kernel/debug/pm_genpd/pm_genpd_summary | grep -Ei 'titan|ife'
 Do not run `cam -l` or other camera enumeration while Snapshot is previewing:
 libcamera resets the sensor's flip controls during enumeration, which turns the
 active preview upside down until Camera is reopened. Video node numbers are not
-fixed; use `media-ctl -p` to resolve `msm_vfe0_video0` for direct capture tests.
+fixed; use `media-ctl -p` (from v4l-utils) to resolve `msm_vfe0_video0` for direct capture tests.
 
 ## Troubleshooting
 

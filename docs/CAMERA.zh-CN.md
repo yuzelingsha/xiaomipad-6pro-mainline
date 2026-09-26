@@ -37,7 +37,7 @@
 | `/usr/local/bin/liuqin-camera` | 启动 Snapshot，并为它重新打开 DMA-BUF 导入（见下文） |
 | `/usr/local/share/applications/org.gnome.Snapshot.desktop`、`/usr/local/share/dbus-1/services/org.gnome.Snapshot.service` | 让「相机」图标和 D-Bus 激活都经过 `liuqin-camera` 启动 |
 
-镜像还预装了 `gnome-snapshot`、`libcamera-ipa`、`gstreamer1.0-libcamera`、`gstreamer1.0-plugins-bad`（`h264parse`）、`gstreamer1.0-plugins-ugly`（录像用的 H.264 编码器）和 `gstreamer1.0-libav`（回放用的 H.264 解码器）。它们只是镜像内容，不是 `liuqin-device-support` 的依赖，卸载它们不会影响设备支持包。
+镜像还预装了 `gnome-snapshot`、`libcamera-ipa`、`gstreamer1.0-libcamera`、`gstreamer1.0-plugins-bad`（`h264parse`）、`gstreamer1.0-plugins-ugly`（录像用的 H.264 编码器）、`gstreamer1.0-libav`（回放用的 H.264 解码器），以及[验证](#验证)一节用到的诊断工具 `libcamera-tools`（`cam`）和 `v4l-utils`（`media-ctl`、`v4l2-ctl`）。它们只是镜像内容，不是 `liuqin-device-support` 的依赖，卸载它们不会影响设备支持包。
 
 ## Snapshot 的 DMA-BUF 导入
 
@@ -63,7 +63,7 @@ sudo cat /sys/kernel/debug/pm_genpd/pm_genpd_summary | grep -Ei 'titan|ife'
                                 # 相机相关电源域应为 off
 ```
 
-Snapshot 正在预览时不要运行 `cam -l` 或其他相机枚举：libcamera 枚举时会重置传感器的翻转控制，导致当前预览上下颠倒，直到重新打开「相机」。视频节点编号不固定，直接采集测试请用 `media-ctl -p` 查找 `msm_vfe0_video0`。
+Snapshot 正在预览时不要运行 `cam -l` 或其他相机枚举：libcamera 枚举时会重置传感器的翻转控制，导致当前预览上下颠倒，直到重新打开「相机」。视频节点编号不固定，直接采集测试请用 `media-ctl -p`（来自 v4l-utils）查找 `msm_vfe0_video0`。
 
 ## 排障
 
