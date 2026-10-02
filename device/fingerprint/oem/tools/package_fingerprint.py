@@ -78,6 +78,7 @@ def main():
     updates["source/fprintd-vendor.tar.gz"] = options.build / "fprintd-vendor.tar.gz"
     updates["source/SOURCE_LOCK.json"] = root / "SOURCE_LOCK.json"
     updates["source/FPRINTD_SOURCE_HASHES.json"] = root / "FPRINTD_SOURCE_HASHES.json"
+    updates["source/protocol/hw_auth_token.h"] = root / "src/fingerprint/protocol/hw_auth_token.h"
     qcbor = root / "src/third_party/QCBOR"
     for directory in ("src", "inc"):
         for path in (qcbor / directory).rglob("*"):

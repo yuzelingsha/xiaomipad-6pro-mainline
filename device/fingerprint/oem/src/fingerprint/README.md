@@ -1,17 +1,18 @@
 # FPC1264 OEM fingerprint components
 
-The development root is `/home/reisa/linux-liuqin`. Current physical observations
-are in `outputs/stable-fpc-20260930/HANDOFF_STABLE_REPACK.md` and
-`docs/FINGERPRINT_PR_STATUS_20261002.md`; those observations are tied to the
-recorded device, boot and program revision. A program bundle's default
-`actual_biometric_acceptance: pending` describes a fresh installation, not the
-result already recorded on this tablet.
+This directory is the internal source layout of the optional
+[OEM component](../../README.md). Build and package commands are run from the
+component root device/fingerprint/oem, unless using the repository wrapper.
+Device status, user steps and acceptance limits are documented in the
+[user guide](../../../../../docs/FINGERPRINT.md). A fresh candidate's
+actual_biometric_acceptance: pending does not inherit the earlier desktop-r3
+physical result.
 
 ## Component map
 
 | Path | Responsibility |
 | --- | --- |
-| `src/kernel/fpc1264` | Stable matching SPI module, IRQ and sensor power |
+| External kernel series | Matching SPI module, IRQ and sensor power |
 | `src/fingerprint/oem` | OEM FPC/Keymaster/Gatekeeper clients, Linux PAM credential input, authorised enrolment and private runtime |
 | `src/third_party/qsee-supplicant` | Listener transport and authenticated UFS RPMB provider |
 | `src/third_party/QCBOR` | Gatekeeper CBOR build dependency |
@@ -22,8 +23,7 @@ result already recorded on this tablet.
 
 `/dev/fpc1020` and the DT compatible `fpc,fpc1020` are the existing device ABI.
 They do not select the historical host software matcher. The daemon explicitly
-uses `FP_DRIVERS_ALLOWLIST=fpc1264_oem`; historical FPC1020 prototypes under
-`archive/` and `src/system/mainline/device/fingerprint/` are separate inputs.
+uses `FP_DRIVERS_ALLOWLIST=fpc1264_oem`; historical host software-matching prototypes are not included in this component.
 
 ## Database boundary
 
@@ -59,7 +59,7 @@ start fprintd, call the TA or enrol a finger.
 ```sh
 OUT_DIR="$PWD/build/review" bash tools/build-tod.sh
 OUT_DIR="$PWD/build/review" bash tools/build-pam-input.sh
-OUT_DIR="$PWD/build/review" bash tools/build-fprintd-oem.sh
+FPRINTD_SOURCE=/path/to/fprintd-v1.94.5 OUT_DIR="$PWD/build/review" bash tools/build-fprintd-oem.sh
 ```
 
 For packaging, use a **copy** of the public firmware/program stage and gather
@@ -72,7 +72,9 @@ current deployed pointer automatically.
 ```sh
 python3 tools/package_fingerprint.py --stage work/review-stage \
   --build build/review --output work/review-candidate.tar.gz \
-  --revision review-20261002
+  --kernel-module /path/to/matching/fpc1264_spi_diag.ko \
+  --candidate-config /path/to/public-config.json \
+  --firmware /path/to/matching-firmware --revision review-20261002
 ```
 
 `prepare.py` puts its generated fprintd patch beside the isolated build tree,

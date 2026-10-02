@@ -1,9 +1,10 @@
 # FPC1264 OEM TOD and final acceptance
 
-Current authority is `outputs/stable-fpc-20260930/HANDOFF_STABLE_REPACK.md` and
-`CURRENT_CANDIDATE.json`. Current sources are under this WSL project's `src/`.
-The private installed bundle is `/usr/local/lib/liuqin-fpc-oem`; `/run` staging
-directories and earlier milestones do not describe the current candidate.
+The public [user guide](../../../../../../docs/FINGERPRINT.md) records support and
+acceptance scope. The installed candidate is identified by its CANDIDATE.json
+and SHA256.json, not by a host-local development path. The private installed
+bundle is /usr/local/lib/liuqin-fpc-oem; /run staging and earlier milestones do
+not identify a new candidate.
 
 The adapter uses the tablet's existing libfprint 1.95.1+tod1 ABI and explicit
 TOD discovery. Build with `tools/build-tod.sh` on that ABI. It does not replace
@@ -39,8 +40,8 @@ authorization. The real confined private daemon on the system D-Bus passed
 GetDevices/Polkit Claim/Release. On the recorded desktop-r3 boot, one real OEM
 print, same-finger matching, daemon-reload matching, other-finger rejection and
 user-observed GNOME unlock passed. Contact-position sensitivity and unlock
-stutter remain. See `docs/FINGERPRINT_PR_STATUS_20261002.md` for the dated
-observations; compilation does not establish reliability or latency.
+stutter remain. See the public user guide for the recorded device scope; compilation does not
+establish reliability or latency.
 
 `fprintd-fpc1264-oem.conf` is installed: the private daemon ExecStart, explicit
 TOD discovery, shared RuntimeDirectoryPreserve=yes, firmware-path exception and
@@ -66,9 +67,9 @@ existing Gatekeeper handle; failures preserve the prior file and uncertain
 output. No fallback identity creation or template reset is performed.
 
 The stable kernel remains a temporary `fastboot boot` image. Ordinary reboot
-returns the installed #1 base; use `tools/device/boot_fingerprint.py` for the
-verified support boot and automatic persistent late module load. No partition
-is flashed. Kernel source/config/ramdisk/DTB and full component hashes are in the
-current manifest; voltage stays 2960000–3008000 microvolts. The specific retry branch, next cold start, suspend/resume and sustained
+returns the installed kernel; temporarily boot the previously accepted support
+image with its exact matching module. The late module service checks the
+candidate identity after the desktop/network/rotation services. No partition
+is flashed. Kernel identity and public component hashes are in the candidate; voltage stays 2960000–3008000 microvolts. The specific retry branch, next cold start, suspend/resume and sustained
 reliability still need their own evidence. Unknown historical GENI memory corruption is not
 declared fixed.

@@ -1,5 +1,7 @@
 # FPC1264 OEM fingerprint support
 
+User guide: [English](../../../docs/FINGERPRINT.md) · [简体中文](../../../docs/FINGERPRINT.zh-CN.md).
+
 Optional Xiaomi Pad 6 Pro (liuqin, SM8475) support using OEM FPC/Keymaster
 trusted applications and real Gatekeeper/RPMB authorization. Includes clients,
 PAM credential input, single-finger enrolment/persistence, libfprint TOD,
