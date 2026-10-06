@@ -124,18 +124,40 @@ def pad_boot_image(source, expected_sha256, size, directory):
     return target, padded.hexdigest()
 
 
+# The RAM shell is BusyBox ash behind telnetd, and every remote command reaches
+# it as one input line.  ash's line-editing buffer refuses a line of 1024 bytes
+# or more: measured on the RAM image, 1023 bytes including the newline are
+# accepted and 1024 are not.  The PTY is not the limit; Linux's canonical
+# input limit is 4095 bytes.
+RAM_SHELL_LINE_BYTES = 1023  # longest accepted line, newline included
+
+
+def frame_command(text, start, end):
+    """Return the input line that runs `text` between the two marker lines.
+
+    A line the RAM shell would refuse raises before anything is sent.
+    """
+    line = ("stty -echo; printf '\\n%s\\n' " + shlex.quote(start) +
+            '; sh -c ' + shlex.quote(text) +
+            "; result=$?; printf '\\n%s %s\\n' " + shlex.quote(end) +
+            ' "$result"\n').encode()
+    if len(line) > RAM_SHELL_LINE_BYTES:
+        raise RuntimeError(f'remote command line is {len(line)} bytes; the RAM shell accepts at most'
+                           f' {RAM_SHELL_LINE_BYTES} including the newline, so it was not sent: '
+                           + repr(text[:80]))
+    return line
+
+
 def command(address, text, timeout=60):
     """Use exact line markers, not command echo, to delimit one shell result."""
     token = 'LIUQIN_' + uuid.uuid4().hex
     start, end = token + '_START', token + '_END'
+    line = frame_command(text, start, end)
     with socket.create_connection((address, 2323), timeout=10) as connection:
         connection.settimeout(1)
         # BusyBox telnetd announces WILL ECHO / WILL SGA / DO NAWS.
         connection.sendall(b'\xff\xfd\x01\xff\xfd\x03\xff\xfc\x1f')
-        connection.sendall(("stty -echo; printf '\\n%s\\n' " + shlex.quote(start) +
-                            '; sh -c ' + shlex.quote(text) +
-                            "; result=$?; printf '\\n%s %s\\n' " + shlex.quote(end) +
-                            ' "$result"\n').encode())
+        connection.sendall(line)
         buffer = bytearray()
         deadline = time.monotonic() + timeout
         pattern = re.compile(rb'(?:^|\n)' + end.encode() + rb' ([0-9]+)\r?\n')
@@ -703,9 +725,9 @@ def stage_blob(remote, name, data):
     path = LAYOUT_WORK + '/liuqin-gpt-' + name + '.b64'
     text = base64.b64encode(data).decode()
     remote(':>' + path)
-    # Commands travel over a telnetd PTY running BusyBox ash. Keeping chunk
-    # sizes at 500 characters guarantees the entire wrapped command line stays
-    # safely below the 1024-byte PTY canonical input buffer limit.
+    # Each chunk is one RAM shell line, which command() bounds by ash's
+    # line-editing buffer (RAM_SHELL_LINE_BYTES).  500 base64 characters plus
+    # the path, the boot_id guard and the markers stay well inside it.
     for index in range(0, len(text), 500):
         remote('printf %s ' + shlex.quote(text[index:index + 500]) + ' >>' + path)
     remote('printf "\\n" >>' + path)

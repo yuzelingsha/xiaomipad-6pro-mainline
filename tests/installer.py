@@ -593,12 +593,52 @@ with tempfile.TemporaryDirectory() as directory:
     assert installer.boot_image_kind(shapes['android v3']) == 'android'
     assert installer.boot_image_kind(shapes['android v4']) == 'android'
 print('PASS: the Python and shell header rules agree on ' + str(len(shapes)) + ' header shapes')
-# Real GPT partition dumps (e.g. 24 KiB sda-head.bin) must be chunked into
-# sizes that fit inside the telnetd/PTY canonical line buffer (<= 1024 bytes),
-# so restoring partition tables never causes PTY buffer overflow or connection drop.
+# Every remote command is one RAM shell line, and ash's line-editing buffer
+# refuses a line of 1024 bytes or more (newline included; measured).  command()
+# refuses such a line before it connects; a line of 1022 bytes plus the
+# newline is still sent.
+assert installer.RAM_SHELL_LINE_BYTES == 1023
+token = 'LIUQIN_' + '0' * 32  # the shape command() draws from uuid4().hex
+start, end = token + '_START', token + '_END'
+# 'a' needs no shell quoting, so each one adds exactly one byte to the line.
+framing = len(installer.frame_command('a', start, end)) - 1
+fits = 'a' * (installer.RAM_SHELL_LINE_BYTES - framing)
+line = installer.frame_command(fits, start, end)
+assert len(line) == 1023 and line.endswith(b'\n') and b'\n' not in line[:-1], len(line)
+connections = []
+
+def refuse_connection(*arguments, **keywords):
+    connections.append(arguments)
+    raise ConnectionRefusedError('test: past the guard')
+
+with patch.object(installer.socket, 'create_connection', side_effect=refuse_connection):
+    try:
+        installer.command('unused', fits + 'a')
+    except RuntimeError as error:
+        assert 'RAM shell accepts at most 1023' in str(error) and 'not sent' in str(error), error
+    else:
+        raise AssertionError('a 1024-byte RAM shell line was not refused')
+    assert not connections, 'the over-long line was refused only after connecting'
+    try:
+        installer.command('unused', fits)
+    except ConnectionRefusedError:
+        pass
+    assert len(connections) == 1, 'a 1023-byte RAM shell line did not reach the connection'
+print('PASS: command() refuses a 1024-byte RAM shell line before connecting and sends a 1023-byte one'
+      ' (newline included)')
+
+# Real GPT partition dumps (e.g. 24 KiB sda-head.bin) are staged in chunks.
+# Each chunk must stay short as text and, wrapped by remote()'s boot_id guard
+# and framed by command(), fit one RAM shell line.
 sent_large = []
 installer.stage_blob(lambda text, timeout=60: sent_large.append(text), 'head', b'\x00' * (24 * 1024))
 assert len(sent_large) > 10, "Large blob should be split into multiple chunks"
 assert all(len(cmd) < 700 for cmd in sent_large), sent_large
-print('PASS: large partition blobs are chunked within PTY line buffer limits')
+guard_source = 'guard = \'test "$(cat /proc/sys/kernel/random/boot_id)" = \' + shlex.quote(boot_id)'
+assert guard_source in installer_source and "guard + ' && ' + text" in installer_source
+guard = 'test "$(cat /proc/sys/kernel/random/boot_id)" = ' + '00000000-0000-0000-0000-000000000000'
+framed = [installer.frame_command(guard + ' && ' + text, start, end) for text in sent_large]
+assert max(map(len, framed)) <= installer.RAM_SHELL_LINE_BYTES, max(map(len, framed))
+print('PASS: large partition blobs are chunked into RAM shell lines of at most '
+      + str(max(map(len, framed))) + ' bytes')
 
