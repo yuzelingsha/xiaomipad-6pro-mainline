@@ -221,3 +221,13 @@ assert installer.LAYOUT_WORK == '/run/liuqin-layout'
 layout_script = (project / 'tools/lib/install-layout.sh').read_text()
 assert 'LIUQIN_LAYOUT_WORK:-' + installer.LAYOUT_WORK in layout_script
 print('PASS: the staged partition-table halves land in the scratch directory the RAM image has')
+
+# Real GPT partition dumps (e.g. 24 KiB sda-head.bin) must be chunked into
+# sizes that fit inside the telnetd/PTY canonical line buffer (<= 1024 bytes),
+# so restoring partition tables never causes PTY buffer overflow or connection drop.
+sent_large = []
+installer.stage_blob(lambda text, timeout=60: sent_large.append(text), 'head', b'\x00' * (24 * 1024))
+assert len(sent_large) > 10, "Large blob should be split into multiple chunks"
+assert all(len(cmd) < 700 for cmd in sent_large), sent_large
+print('PASS: large partition blobs are chunked within PTY line buffer limits')
+
