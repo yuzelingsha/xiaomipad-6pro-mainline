@@ -5,9 +5,13 @@
 #
 # Derived from xiaomi-mipps-auth by ianchb
 # (https://github.com/ianchb/xiaomi-mipps-auth), written for the Xiaomi Pad
-# 6S Pro and also shipped by Armbian.  Adapted for liuqin (Xiaomi Pad 6 Pro):
-# renamed state paths and unit, added --allow-unverified-adapter with a cable
-# capability gate.  Original authorship and licence are retained.
+# 6S Pro and also shipped by Armbian.  Original authorship and licence are
+# retained.
+#
+# Adapted for liuqin (Xiaomi Pad 6 Pro) by xiaoabiao
+# (https://github.com/yzddmr6/xiaomipad-6pro-mainline/pull/7): renamed state
+# paths and unit, and the --allow-unverified-adapter switch for standard PPS
+# adapters.  The switch's cable capability gate was added on integration.
 
 import argparse
 import glob

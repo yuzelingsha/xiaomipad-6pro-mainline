@@ -34,8 +34,10 @@ Charger authentication
 * liuqin-mipps-auth (device/gnome-overlay/usr/local/libexec/liuqin-mipps-auth)
   is derived from xiaomi-mipps-auth by ianchb,
   https://github.com/ianchb/xiaomi-mipps-auth, GPL-2.0-only; the file-level
-  SPDX identifier and authorship notice are retained. It is not covered by
-  the project's MIT license.
+  SPDX identifier and authorship notice are retained. The liuqin adaptation
+  and the standard PPS switch (--allow-unverified-adapter) are by xiaoabiao,
+  https://github.com/yzddmr6/xiaomipad-6pro-mainline/pull/7. The file is not
+  covered by the project's MIT license.
 
 Desktop and build components
 ----------------------------
