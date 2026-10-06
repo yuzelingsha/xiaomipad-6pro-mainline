@@ -689,8 +689,11 @@ def stage_blob(remote, name, data):
     path = LAYOUT_WORK + '/liuqin-gpt-' + name + '.b64'
     text = base64.b64encode(data).decode()
     remote(':>' + path)
-    for index in range(0, len(text), 3000):
-        remote('printf %s ' + shlex.quote(text[index:index + 3000]) + ' >>' + path)
+    # Commands travel over a telnetd PTY running BusyBox ash. Keeping chunk
+    # sizes at 500 characters guarantees the entire wrapped command line stays
+    # safely below the 1024-byte PTY canonical input buffer limit.
+    for index in range(0, len(text), 500):
+        remote('printf %s ' + shlex.quote(text[index:index + 500]) + ' >>' + path)
     remote('printf "\\n" >>' + path)
 
 

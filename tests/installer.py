@@ -533,3 +533,12 @@ with tempfile.TemporaryDirectory() as directory:
     assert installer.boot_image_kind(shapes['android v3']) == 'android'
     assert installer.boot_image_kind(shapes['android v4']) == 'android'
 print('PASS: the Python and shell header rules agree on ' + str(len(shapes)) + ' header shapes')
+# Real GPT partition dumps (e.g. 24 KiB sda-head.bin) must be chunked into
+# sizes that fit inside the telnetd/PTY canonical line buffer (<= 1024 bytes),
+# so restoring partition tables never causes PTY buffer overflow or connection drop.
+sent_large = []
+installer.stage_blob(lambda text, timeout=60: sent_large.append(text), 'head', b'\x00' * (24 * 1024))
+assert len(sent_large) > 10, "Large blob should be split into multiple chunks"
+assert all(len(cmd) < 700 for cmd in sent_large), sent_large
+print('PASS: large partition blobs are chunked within PTY line buffer limits')
+
