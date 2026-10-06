@@ -569,7 +569,7 @@ ln -s ../bin/busybox "$staging/sbin/mdev"
 
 if [ -n "${INSTALLER_RUNTIME:-}" ]; then
 	[ -x "$INSTALLER_RUNTIME/usr/bin/tar" ] && [ -x "$INSTALLER_RUNTIME/usr/sbin/mkfs.ext4" ] &&
-		[ -x "$INSTALLER_RUNTIME/usr/sbin/sgdisk" ] ||
+		[ -x "$INSTALLER_RUNTIME/usr/sbin/e2fsck" ] && [ -x "$INSTALLER_RUNTIME/usr/sbin/sgdisk" ] ||
 		{ echo 'installer runtime is incomplete' >&2; exit 1; }
 	cp -a "$INSTALLER_RUNTIME"/. "$staging"/
 	mkdir -p "$staging/usr/lib/liuqin"

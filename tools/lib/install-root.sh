@@ -3,40 +3,56 @@
 # Device-side installer, intended only for the dedicated read-only RAM image.
 set -eu
 die() { printf 'liuqin-install: %s\n' "$*" >&2; exit 1; }
-usage='usage: install-root.sh BOOT_ID ROOTFS_URL SHA256 BYTES ERASE-LIUQIN-USERDATA ROOT_PARTNAME HOME_PARTNAME [ENABLE-USB-RESCUE] [SWITCH-STORE ubuntu URL SHA256 BYTES android URL SHA256 BYTES]'
+usage='usage: install-root.sh BOOT_ID ROOTFS_URL SHA256 BYTES ERASE-LIUQIN-USERDATA ROOT_PARTNAME HOME_PARTNAME [ENABLE-USB-RESCUE] [KEEP-HOME] [SWITCH-STORE ubuntu URL SHA256 BYTES android URL SHA256 BYTES]'
 [ "$#" -ge 7 ] || die "$usage"
 [ "$5" = ERASE-LIUQIN-USERDATA ] || die 'explicit data-erasure acknowledgement required'
 root_name=$6
 home_name=$7
-# The dual layout adds the switch store: the Ubuntu and Android boot images
-# that liuqin-switch rotates through boot_a, fetched from the host like the
-# root archive.  Its eight arguments are always last.
+# The options follow the seven fixed arguments.  ENABLE-USB-RESCUE and
+# KEEP-HOME may each be given once, in either order (the host sends them in
+# the order of the usage line).  KEEP-HOME reinstalls the system and keeps the
+# existing LIUQIN_HOME filesystem.  The dual layout adds the switch store: the
+# Ubuntu and Android boot images that liuqin-switch rotates through boot_a,
+# fetched from the host like the root archive.  SWITCH-STORE and its eight
+# fields are always last.
 rescue=
-store_at=
-case $# in
-7) ;;
-8) rescue=$8 ;;
-16) store_at=8 ;;
-17) rescue=$8; store_at=9 ;;
-*) die "$usage" ;;
-esac
-case $rescue in ''|ENABLE-USB-RESCUE) ;; *) die 'unsupported rescue option' ;; esac
+keep_home=
+store=
 switch_store=${0%/*}/install-switch-store.sh
 store_ubuntu_url='' store_ubuntu_sha='' store_ubuntu_bytes=''
 store_android_url='' store_android_sha='' store_android_bytes=''
-store_fields() { # <index of SWITCH-STORE> "$@"
-	sf_skip=$1
-	shift
-	shift $((sf_skip - 1))
-	[ "$1" = SWITCH-STORE ] || die 'unsupported option; expected SWITCH-STORE'
+store_fields() { # SWITCH-STORE ubuntu URL SHA256 BYTES android URL SHA256 BYTES
 	shift
 	[ -f "$switch_store" ] || die 'the switch-store step is missing from the installer image'
 	# Validate everything before anything is formatted.
 	sh "$switch_store" --check "$@"
+	store=SWITCH-STORE
 	store_ubuntu_url=$2 store_ubuntu_sha=$3 store_ubuntu_bytes=$4
 	store_android_url=$6 store_android_sha=$7 store_android_bytes=$8
 }
-[ -z "$store_at" ] || store_fields "$store_at" "$@"
+parse_options() { # the script's own arguments
+	shift 7
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		ENABLE-USB-RESCUE)
+			[ -z "$rescue" ] || die "option given twice: $1; $usage"
+			rescue=$1
+			;;
+		KEEP-HOME)
+			[ -z "$keep_home" ] || die "option given twice: $1; $usage"
+			keep_home=$1
+			;;
+		SWITCH-STORE)
+			[ "$#" = 9 ] || die "$usage"
+			store_fields "$@"
+			return 0
+			;;
+		*) die "unsupported option: $1; $usage" ;;
+		esac
+		shift
+	done
+}
+parse_options "$@"
 [ "$(cat /proc/sys/kernel/random/boot_id)" = "$1" ] || die 'RAM boot identity changed'
 [ "$(cat /etc/liuqin-installer 2>/dev/null)" = liuqin ] || die 'not the installer RAM image'
 ln -sf /proc/self/fd/0 /dev/stdin
@@ -58,6 +74,63 @@ find_part() {
 		die "partition is missing: $1 —— 该设备不是受支持的小米平板 6 Pro（liuqin），或分区步骤未完成"
 	printf '%s' "$found"
 }
+# The label is the identity of the home filesystem, as it is in fstab.
+# e2label comes with the installer's e2fsprogs.  The installer's BusyBox has no
+# blkid, so an image built without e2label reads the ext2/3/4 superblock
+# itself: magic 0xEF53 at byte 1080, the 16-byte volume name at byte 1144.
+home_label() { # <device>
+	if [ -x /usr/sbin/e2label ]; then
+		/usr/sbin/e2label "$1"
+		return
+	fi
+	[ "$(/bin/busybox dd if="$1" bs=1 skip=1080 count=2 2>/dev/null |
+		/bin/busybox od -An -tx1 | /bin/busybox tr -d ' \n')" = 53ef ] || return 1
+	/bin/busybox dd if="$1" bs=1 skip=1144 count=16 2>/dev/null | /bin/busybox tr -d '\000'
+}
+check_home() { # <device>: KEEP-HOME keeps only the filesystem this installer made
+	ch_label=$(home_label "$1") || ch_label=
+	[ "$ch_label" = LIUQIN_HOME ] ||
+		die "KEEP-HOME: $1 does not hold the LIUQIN_HOME filesystem (label '$ch_label');" \
+			'nothing was formatted —— linux_home 上没有可保留的 LIUQIN_HOME 文件系统，未格式化任何分区'
+}
+# Without KEEP-HOME the home partition is formatted.  With it, the existing
+# filesystem must carry the LIUQIN_HOME label and pass `e2fsck -p` (status 0,
+# nothing to fix, or 1, fixed); anything else stops the installation.  This
+# runs in the write window before the system partition is formatted, so a
+# home that cannot be kept stops the installation with nothing changed.
+prepare_home() { # <device> <KEEP-HOME or empty>
+	case $2 in
+	'')
+		/usr/sbin/mkfs.ext4 -F -L LIUQIN_HOME -m 0 "$1"
+		return 0
+		;;
+	KEEP-HOME) ;;
+	*) die 'unsupported home mode' ;;
+	esac
+	check_home "$1"
+	ph_status=0
+	/usr/sbin/e2fsck -p "$1" || ph_status=$?
+	[ "$ph_status" -lt 2 ] ||
+		die "KEEP-HOME: e2fsck -p $1 exited with status $ph_status; nothing was formatted" \
+			'—— linux_home 文件系统检查未通过，未格式化任何分区'
+}
+# Whether the root archive's /home skeleton is copied onto the mounted home:
+# always onto a fresh filesystem; onto a kept one only when it holds nothing
+# but lost+found.
+home_needs_skeleton() { # <mounted home> <KEEP-HOME or empty>
+	[ "$2" = KEEP-HOME ] || return 0
+	hs_count=0
+	for hs_entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+		[ -e "$hs_entry" ] || [ -L "$hs_entry" ] || continue
+		[ "${hs_entry##*/}" != lost+found ] || continue
+		hs_count=$((hs_count + 1))
+	done
+	if [ "$hs_count" -gt 0 ]; then
+		printf 'liuqin-install: keeping existing /home (%s entries)\n' "$hs_count"
+		return 1
+	fi
+	printf 'liuqin-install: home partition is empty; seeding the skeleton\n'
+}
 root=$(find_part "$root_name")
 home=$(find_part "$home_name")
 [ "$root" != "$home" ] || die 'the system and home partitions must differ'
@@ -78,6 +151,9 @@ for target in "$root" "$home"; do
 		die 'a target partition is mounted (including through a device alias)'
 	[ "$(/bin/busybox blockdev --getro "$target")" = 1 ] || die 'a target partition is not initially read-only'
 done
+# A home that cannot be kept is refused before anything is downloaded; the
+# check is repeated in the write window, together with e2fsck.
+[ -z "$keep_home" ] || check_home "$home"
 battery=
 for supply in /sys/class/power_supply/*; do
 	[ "$(cat "$supply/type" 2>/dev/null)" = Battery ] || continue
@@ -144,8 +220,8 @@ done
 opened=true
 /bin/busybox blockdev --setrw "$root"
 /bin/busybox blockdev --setrw "$home"
+prepare_home "$home" "$keep_home"
 /usr/sbin/mkfs.ext4 -F -L LIUQIN_ROOT -m 0 "$root"
-/usr/sbin/mkfs.ext4 -F -L LIUQIN_HOME -m 0 "$home"
 mount -t ext4 "$root" /mnt/install
 mounted=true
 mkdir /mnt/install/native-root
@@ -160,13 +236,13 @@ fi
 # home partition from holding up the boot at the console-less first start.
 mount -t ext4 "$home" /mnt/install-home
 home_mounted=true
-if [ -d /mnt/install/native-root/home ]; then
+if home_needs_skeleton /mnt/install-home "$keep_home" && [ -d /mnt/install/native-root/home ]; then
 	/usr/bin/tar -C /mnt/install/native-root/home -cf - . --numeric-owner --acls --xattrs \
 		--xattrs-include='*' | /usr/bin/tar -C /mnt/install-home -xf - \
 		--numeric-owner --same-owner --same-permissions --acls --xattrs --xattrs-include='*' \
 		--warning=no-timestamp
 fi
-if [ -n "$store_at" ]; then
+if [ -n "$store" ]; then
 	sh "$switch_store" /mnt/install/native-root \
 		ubuntu "$store_ubuntu_url" "$store_ubuntu_sha" "$store_ubuntu_bytes" \
 		android "$store_android_url" "$store_android_sha" "$store_android_bytes"

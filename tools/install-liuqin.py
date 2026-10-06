@@ -548,14 +548,7 @@ def main(argv=None):
             flashes = stock_images_to_flash(device_layout, {
                 name: entry for name, entry in rom_images.items() if name != ANDROID_BOOT_IMAGE})
         base = f'http://{args.host_address}:{server.server_port}'
-        install = ['sh', '/usr/lib/liuqin/install-root.sh', boot_id, base + '/rootfs.tar.gz',
-                   manifest['files']['rootfs.tar.gz'], str((bundle / 'rootfs.tar.gz').stat().st_size),
-                   'ERASE-LIUQIN-USERDATA', layout.ROOT_NAME, layout.HOME_NAME]
-        if args.enable_rescue:
-            install.append('ENABLE-USB-RESCUE')
-        if args.layout == 'dual':
-            install += switch_store_arguments(base, manifest['files']['boot.img'], bundle / 'boot.img',
-                                              rom_images[ANDROID_BOOT_IMAGE])
+        install = install_root_command(boot_id, base, bundle, manifest, args, rom_images)
         print('Installing Ubuntu into ' + layout.ROOT_NAME + '.', flush=True)
         result = remote(shlex.join(install), 3600)
         if b'liuqin-install: ROOT_INSTALLED' not in result:
@@ -610,6 +603,27 @@ def finish_in_fastboot(fastboot, mode, flashes, padded_image, padded_sha256, par
         fastboot('flash', 'boot_' + slot, str(padded_image))
     fastboot('--set-active=' + slots[0])
     fastboot('reboot')
+
+
+def install_root_command(boot_id, base_url, bundle, manifest, args, rom_images):
+    """The install-root.sh command line.
+
+    The seven fixed arguments come first, then the options in this order:
+    ENABLE-USB-RESCUE (--enable-rescue), KEEP-HOME (--keep-home: check and keep
+    the existing LIUQIN_HOME filesystem instead of formatting it), and in the
+    dual layout SWITCH-STORE with its eight fields, which is always last.
+    """
+    install = ['sh', '/usr/lib/liuqin/install-root.sh', boot_id, base_url + '/rootfs.tar.gz',
+               manifest['files']['rootfs.tar.gz'], str((bundle / 'rootfs.tar.gz').stat().st_size),
+               'ERASE-LIUQIN-USERDATA', layout.ROOT_NAME, layout.HOME_NAME]
+    if args.enable_rescue:
+        install.append('ENABLE-USB-RESCUE')
+    if args.keep_home:
+        install.append('KEEP-HOME')
+    if args.layout == 'dual':
+        install += switch_store_arguments(base_url, manifest['files']['boot.img'], bundle / 'boot.img',
+                                          rom_images[ANDROID_BOOT_IMAGE])
+    return install
 
 
 def switch_store_arguments(base_url, ubuntu_sha256, ubuntu_image, android_entry):

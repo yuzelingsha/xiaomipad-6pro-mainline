@@ -161,7 +161,8 @@ assert subprocess.run(['sh', str(project / 'tools/lib/install-root.sh')], captur
 invalid = subprocess.run(['sh', str(project / 'tools/lib/install-root.sh'),
                           'unused', 'unused', 'unused', 'unused', 'ERASE-LIUQIN-USERDATA',
                           'linux_root', 'linux_home', 'INVALID'], capture_output=True)
-assert invalid.returncode != 0 and b'unsupported rescue option' in invalid.stderr
+assert invalid.returncode != 0 and b'unsupported option: INVALID' in invalid.stderr and \
+    b'usage: install-root.sh' in invalid.stderr, invalid.stderr
 unauthorized = subprocess.run(['sh', str(project / 'tools/lib/install-root.sh'),
                                'unused', 'unused', 'unused', 'unused', 'NO',
                                'linux_root', 'linux_home'], capture_output=True)
@@ -360,9 +361,27 @@ with tempfile.TemporaryDirectory() as directory:
     # anything, and refuses a malformed one.
     base = ['sh', str(project / 'tools/lib/install-root.sh'), 'not-this-boot', 'u', 's', '1',
             'ERASE-LIUQIN-USERDATA', 'linux_root', 'linux_home']
+    # Reaching the boot-identity check means every option was accepted: it is
+    # the first test after the option scan, and nothing has been touched yet.
+    accepted = b'RAM boot identity changed'
     for extra, fragment in (
-            (arguments, b'RAM boot identity changed'),
-            (['ENABLE-USB-RESCUE'] + arguments, b'RAM boot identity changed'),
+            ([], accepted),
+            (arguments, accepted),
+            (['ENABLE-USB-RESCUE'] + arguments, accepted),
+            (['KEEP-HOME'], accepted),
+            (['ENABLE-USB-RESCUE', 'KEEP-HOME'], accepted),
+            (['KEEP-HOME', 'ENABLE-USB-RESCUE'], accepted),
+            (['KEEP-HOME'] + arguments, accepted),
+            (['ENABLE-USB-RESCUE', 'KEEP-HOME'] + arguments, accepted),
+            (['KEEP-HOME', 'ENABLE-USB-RESCUE'] + arguments, accepted),
+            (['KEEP-HOME', 'KEEP-HOME'], b'option given twice: KEEP-HOME'),
+            (['ENABLE-USB-RESCUE', 'KEEP-HOME', 'ENABLE-USB-RESCUE'], b'option given twice: ENABLE-USB-RESCUE'),
+            (['KEEP-HOME', 'KEEP-HOME'] + arguments, b'option given twice: KEEP-HOME'),
+            (['KEEP-HOME', 'KEEP-THE-HOME'], b'unsupported option: KEEP-THE-HOME'),
+            (['keep-home'], b'unsupported option: keep-home'),
+            (['KEEP-HOME', ''], b'unsupported option: ;'),
+            # SWITCH-STORE takes exactly its eight fields and comes last.
+            (arguments + ['KEEP-HOME'], b'usage: install-root.sh'),
             (['NOT-A-STORE'] + arguments[1:], b'unsupported option'),
             (arguments[:3] + ['nothex'] + arguments[4:], b'invalid ubuntu sha256'),
             (arguments[:5] + ['ubuntu'] + arguments[6:], b'expected the android image'),
@@ -371,7 +390,48 @@ with tempfile.TemporaryDirectory() as directory:
             (arguments[:-1], b'usage')):
         result = subprocess.run(base + extra, capture_output=True)
         assert result.returncode != 0 and fragment in result.stderr, (extra, result.stderr)
-print('PASS: the switch-store arguments are built for and validated by install-root.sh')
+        # A refused shape stops in the option scan, before the identity check.
+        assert fragment == accepted or accepted not in result.stderr, (extra, result.stderr)
+print('PASS: the switch-store arguments are built for and validated by install-root.sh; '
+      'ENABLE-USB-RESCUE and KEEP-HOME are accepted once each in either order, before SWITCH-STORE')
+
+# The host builds the install-root.sh command: KEEP-HOME only with --keep-home,
+# in the documented order, and every shape it builds is one the device script
+# accepts.
+with tempfile.TemporaryDirectory() as directory:
+    bundle = Path(directory)
+    (bundle / 'rootfs.tar.gz').write_bytes(b'rootfs')
+    (bundle / 'boot.img').write_bytes(boot_header('ubuntu') + bytes(4096))
+    android = bundle / 'android.img'
+    android.write_bytes(boot_header('android') + bytes(8192))
+    manifest = {'files': {'rootfs.tar.gz': 'c' * 64, 'boot.img': 'a' * 64}}
+    rom_images = {installer.ANDROID_BOOT_IMAGE: {'sha256': 'b' * 64, 'path': android}}
+    fixed = ['sh', '/usr/lib/liuqin/install-root.sh', 'not-this-boot', 'http://192.168.7.1:8000/rootfs.tar.gz',
+             'c' * 64, '6', 'ERASE-LIUQIN-USERDATA', installer.layout.ROOT_NAME, installer.layout.HOME_NAME]
+    for layout_mode in ('linux-only', 'dual'):
+        for enable_rescue in (False, True):
+            for keep_home in (False, True):
+                args = SimpleNamespace(layout=layout_mode, enable_rescue=enable_rescue, keep_home=keep_home)
+                built = installer.install_root_command('not-this-boot', 'http://192.168.7.1:8000', bundle,
+                                                       manifest, args, rom_images)
+                options = built[len(fixed):]
+                expected = (['ENABLE-USB-RESCUE'] if enable_rescue else []) + \
+                    (['KEEP-HOME'] if keep_home else [])
+                if layout_mode == 'dual':
+                    expected += installer.switch_store_arguments(
+                        'http://192.168.7.1:8000', 'a' * 64, bundle / 'boot.img',
+                        rom_images[installer.ANDROID_BOOT_IMAGE])
+                assert built[:len(fixed)] == fixed, built
+                assert options == expected, (layout_mode, enable_rescue, keep_home, built)
+                assert ('KEEP-HOME' in built) == keep_home, built
+                result = subprocess.run(['sh', str(project / 'tools/lib/install-root.sh'), *built[2:]],
+                                        capture_output=True)
+                assert result.returncode != 0 and accepted in result.stderr, (built, result.stderr)
+    # main() hands exactly this command to the tablet.
+    assert 'install = install_root_command(boot_id, base, bundle, manifest, args, rom_images)' in \
+        (project / 'tools/install-liuqin.py').read_text()
+print('PASS: the host sends KEEP-HOME only with --keep-home, after ENABLE-USB-RESCUE and before '
+      'SWITCH-STORE, and install-root.sh accepts every shape the host builds')
 
 # What the tablet holds after the dual installation, as liuqin-switch sees it.
 # boot_a starts out as the stock Android image, whose AVB footer sits at the

@@ -159,7 +159,9 @@ USB 网络通常通过 DHCP 配置；必要时可用 `--host-address` 指定主�
 
 若只重装系统并保留 `/home`，使用 `--keep-home`：沿用现有尺寸，
 不触碰 `linux_home`，只重装 `linux_root`；该选项不可与 `--android-size`
-或 `--root-size` 同时使用。
+或 `--root-size` 同时使用。格式化任何分区之前，安装器先核对 `linux_home` 上现有的
+`LIUQIN_HOME` 文件系统（先查卷标，再运行 `e2fsck -p`），不符即停止；通过后原样保留，
+仅当其为空时才写入默认的 `/home` 内容。
 
 要更改切分比例，先恢复出厂分区表，再重新安装：
 

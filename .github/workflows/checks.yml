@@ -46,6 +46,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y busybox-static
           sh tests/install-layout.sh
+      - name: Device-side home preservation
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y busybox-static e2fsprogs
+          sh tests/install-root.sh
       - name: Sensor startup policy
         run: |
           sudo apt-get update

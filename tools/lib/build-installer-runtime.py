@@ -24,6 +24,9 @@ def main():
                ('usr/bin/install', root / 'usr/bin/install'),
                ('usr/sbin/mkfs.ext4', root / 'usr/sbin/mkfs.ext4'),
                ('usr/sbin/e2fsck', root / 'usr/sbin/e2fsck'),
+               # install-root.sh KEEP-HOME reads the home filesystem's label.
+               # e2label is tune2fs under another name; the copy keeps the name.
+               ('usr/sbin/e2label', root / 'usr/sbin/e2label'),
                ('usr/sbin/getcap', root / 'usr/sbin/getcap'),
                # The layout step edits the GPT on the device, so the partition
                # editor has to be the distribution's, matched with its libuuid.

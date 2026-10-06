@@ -203,7 +203,10 @@ through the move.
 To reinstall the system on an existing split and keep `/home`, pass
 `--keep-home`. It keeps the existing sizes, leaves `linux_home` untouched and
 reinstalls `linux_root` only, so it may not be combined with `--android-size`
-or `--root-size`.
+or `--root-size`. Before anything is formatted, the installer checks that
+`linux_home` holds the existing `LIUQIN_HOME` filesystem (its label, then
+`e2fsck -p`) and stops if it does not; the filesystem is then kept as it is,
+and only an empty one receives the default `/home` contents.
 
 To change the split, restore the stock partition table and install again:
 
