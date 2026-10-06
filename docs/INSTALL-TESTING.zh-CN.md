@@ -305,6 +305,13 @@ sudo liuqin-rescue on
 不要将此端口转发或暴露到其他网络。诊断结束后，在平板上执行 `sudo liuqin-rescue off` 关闭通道；
 现有救援连接也会断开。
 
+## 已知问题
+
+部分平板在启动传感器处理器（SLPI）时会复位。遇到这种情况，可创建空标记文件
+`/etc/liuqin-slpi-disabled`（例如执行 `sudo touch /etc/liuqin-slpi-disabled`）后重启：
+`liuqin-slpi.service` 将被跳过，SLPI 不再启动。标记存在期间自动旋转不可用；删除该文件并重启即可恢复启动 SLPI。
+切勿直接修改 `/etc/systemd/system/liuqin-slpi.service`：boot 镜像会校验该文件，文件被改动后将拒绝启动该根分区。
+
 ## 恢复 Android
 
 仅恢复 Android 会清除 Ubuntu，需要使用匹配的原厂 Fastboot ROM 完成系统恢复和 userdata 初始化。

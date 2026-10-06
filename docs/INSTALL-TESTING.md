@@ -388,6 +388,16 @@ connection; do not expose or forward this port to other networks. After
 diagnostics, run `sudo liuqin-rescue off` on the tablet to disable it and
 close existing rescue connections. Release images leave it disabled by default.
 
+## Known Issues
+
+On some units, starting the sensor processor (SLPI) resets the tablet. On such
+a unit, create the empty marker file `/etc/liuqin-slpi-disabled` (for example
+with `sudo touch /etc/liuqin-slpi-disabled`) and reboot: `liuqin-slpi.service`
+is then skipped and SLPI is not started. Automatic screen rotation is
+unavailable while the marker exists; delete it and reboot to start SLPI again.
+Never edit `/etc/systemd/system/liuqin-slpi.service` itself: the boot image
+verifies that file and refuses to start a root on which it has been modified.
+
 ## Recovery
 
 Returning to Android alone erases the Ubuntu installation and requires a

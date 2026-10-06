@@ -15,6 +15,12 @@ unit = configparser.ConfigParser(interpolation=None, strict=False)
 unit.read(overlay / 'etc/systemd/system/liuqin-hexagonrpcd-sdsp.service')
 assert 'liuqin-slpi.service' in unit['Unit']['Requires'].split()
 assert 'liuqin-slpi.service' in unit['Unit']['After'].split()
+# The SLPI unit is root-contract pinned, so the local opt-out must be a marker
+# the unit checks, never an edit to the unit; the overlay must not ship it.
+slpi_unit = configparser.ConfigParser(interpolation=None, strict=False)
+slpi_unit.read(overlay / 'etc/systemd/system/liuqin-slpi.service')
+assert slpi_unit['Unit']['ConditionPathExists'] == '!/etc/liuqin-slpi-disabled'
+assert not (overlay / 'etc/liuqin-slpi-disabled').exists()
 assert 'qcom_q6v5_pas.slpi_auto_boot=0' in (
     project / 'device/native-bootargs.txt').read_text().split()
 

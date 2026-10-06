@@ -1,5 +1,7 @@
 [Unit]
 Description=liuqin sensor processor lifecycle
+# Local opt-out for units on which starting SLPI resets the tablet.
+ConditionPathExists=!/etc/liuqin-slpi-disabled
 After=systemd-udevd.service systemd-tmpfiles-setup.service
 Before=liuqin-hexagonrpcd-sdsp.service
 
