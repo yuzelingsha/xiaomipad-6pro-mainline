@@ -91,6 +91,7 @@ With Camera closed:
 
 ```sh
 cam -l                          # from libcamera-tools; expect an internal back camera
+cam -c1 --capture=3             # capture three frames; each output line reports one frame
 sudo cat /sys/kernel/debug/pm_genpd/pm_genpd_summary | grep -Ei 'titan|ife'
                                 # the camera domains should be off
 ```

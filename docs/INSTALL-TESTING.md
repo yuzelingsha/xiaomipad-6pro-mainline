@@ -10,9 +10,7 @@ unit: the partition table was split, Ubuntu was installed into `linux_root`
 with `/home` on `linux_home`, and Ubuntu booted from slot B. The current
 revision boots both systems from slot A and switches between them by
 exchanging the boot image in `boot_a` (see
-[Switching Between the Systems](#switching-between-the-systems)). That
-arrangement, the switch in either direction, Android's first boot and KernelSU
-have not yet been validated on hardware. The Linux-only layout uses the same
+[Switching Between the Systems](#switching-between-the-systems)). The current revision has been installed on the same unit with `--layout dual --keep-home` (v0.5.0): the reinstall kept `/home`, Ubuntu boots from slot A, and `liuqin-switch verify` confirms the switch store. The switch in either direction, Android's first boot and KernelSU have not yet been tested on hardware. The Linux-only layout uses the same
 layout engine but has not been installed on hardware. Treat both as attended
 experiments.
 

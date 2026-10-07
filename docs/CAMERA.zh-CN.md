@@ -59,6 +59,7 @@ gsettings set org.gnome.Snapshot enable-hardware-encoding false
 
 ```sh
 cam -l                          # 来自 libcamera-tools，应列出一个 internal back 摄像头
+cam -c1 --capture=3             # 采集 3 帧，每帧输出一行
 sudo cat /sys/kernel/debug/pm_genpd/pm_genpd_summary | grep -Ei 'titan|ife'
                                 # 相机相关电源域应为 off
 ```
